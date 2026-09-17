@@ -17,12 +17,22 @@ from .errors import (
     Unsupported,
     VaultFailure,
 )
+from .documents import (
+    Entry,
+    WriteResult,
+    write_file,
+    write_in_transaction,
+)
 from .vault import Vault, create_vault, open_vault
 
 __all__ = [
     "Vault",
     "create_vault",
     "open_vault",
+    "Entry",
+    "WriteResult",
+    "write_file",
+    "write_in_transaction",
     "MemhubError",
     "InvalidInput",
     "Missing",
