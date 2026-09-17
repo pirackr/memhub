@@ -19,7 +19,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Optional
 
-__all__ = ["Entry", "WriteResult", "ReadResult"]
+__all__ = ["Entry", "WriteResult", "ReadResult", "ListResult"]
 
 
 @dataclass(frozen=True)
@@ -71,3 +71,19 @@ class ReadResult:
     start_line: int
     end_line: Optional[int]
     has_more: bool
+
+
+@dataclass(frozen=True)
+class ListResult:
+    """The result of a :func:`memhub.tree.list_entries` operation.
+
+    ``entries`` are the :class:`Entry` views of the directory's immediate
+    children (or, for a recursive listing, every descendant). ``has_more``
+    reports whether further entries remain past this page. ``next_offset`` is
+    the zero-based offset to pass for the following page, or ``None`` on the
+    final page where no continuation exists.
+    """
+
+    entries: list[Entry]
+    has_more: bool
+    next_offset: Optional[int]

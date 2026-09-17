@@ -25,6 +25,8 @@ from .documents import (
     write_file,
     write_in_transaction,
 )
+from .models import ListResult
+from .tree import list_entries
 from .vault import Vault, create_vault, open_vault
 
 __all__ = [
@@ -34,9 +36,11 @@ __all__ = [
     "Entry",
     "ReadResult",
     "WriteResult",
+    "ListResult",
     "write_file",
     "write_in_transaction",
     "read_file",
+    "list_entries",
     "MemhubError",
     "InvalidInput",
     "Missing",

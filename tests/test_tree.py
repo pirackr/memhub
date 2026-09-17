@@ -20,8 +20,9 @@ import sqlite3
 import pytest
 
 import memhub
-from memhub.errors import Conflict, Missing
-from memhub.tree import ensure_directories, resolve
+from memhub.errors import Conflict, InvalidInput, Missing
+from memhub.tree import ensure_directories, list_entries, resolve
+from memhub.models import ListResult
 
 # SQL that inserts a valid child directly into the entries table.
 _INSERT_CHILD = (
@@ -378,3 +379,255 @@ def test_created_parents_rollback_leaves_integrity_ok(vault):
             ensure_directories(vault.connection, "/rollback/a")
             raise RuntimeError("abort")
     assert vault.connection.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+
+
+# ---------------------------------------------------------------------------
+# list_entries: bounded directory discovery.
+# ---------------------------------------------------------------------------
+
+
+def _write_children(vault, parent_canonical, names):
+    """Create ``names`` as files directly under ``parent_canonical``.
+
+    ``parent_canonical`` is resolved to its directory row so children land as
+    real descendants (e.g. ``/dir`` yields a child at ``/dir/<name>``) rather
+    than always being attached to the root. The parent must already exist.
+    """
+    parent_id = resolve(vault.connection, parent_canonical)["id"]
+    with vault.transaction(write=True):
+        for name in names:
+            stamp = "2026-09-17T00:00:00+00:00"
+            vault.connection.execute(
+                "INSERT INTO entries "
+                "(parent_id, name, kind, content, created_at, updated_at) "
+                "VALUES (?, ?, 'file', ?, ?, ?)",
+                (parent_id, name, name.upper(), stamp, stamp),
+            )
+
+
+def test_public_list_operation_returns_list_result(vault):
+    _write_children(vault, "/", ["alpha", "beta"])
+    result = list_entries(vault, "/")
+    assert isinstance(result, ListResult)
+    assert [e.path for e in result.entries] == ["/alpha", "/beta"]
+    assert result.entries[0].kind == "file"
+    assert result.entries[0].size_bytes == 5  # "ALPHA"
+    assert result.has_more is False
+    assert result.next_offset is None
+
+
+def test_listing_default_path_is_root(vault):
+    _write_children(vault, "/", ["x", "y"])
+    with vault.transaction(write=True):
+        ensure_directories(vault.connection, "/a/b")
+    result = list_entries(vault)
+    assert sorted(e.path for e in result.entries) == ["/a", "/x", "/y"]
+
+
+def test_listing_excludes_the_selected_directory(vault):
+    _write_children(vault, "/", ["only"])
+    result = list_entries(vault, "/")
+    assert [e.path for e in result.entries] == ["/only"]
+    assert all(e.path != "/" for e in result.entries)
+
+
+def test_immediate_listing_keeps_directory_contents_out(vault):
+    with vault.transaction(write=True):
+        ensure_directories(vault.connection, "/dir")
+    _write_children(vault, "/dir", ["inside"])
+    result = list_entries(vault, "/")
+    # "dir" appears once as a navigable entry; "inside" is not expanded inline.
+    assert [e.path for e in result.entries] == ["/dir"]
+
+
+def test_listing_orders_by_binary_path(vault):
+    with vault.transaction(write=True):
+        ensure_directories(vault.connection, "/dir")
+    _write_children(vault, "/dir", ["b", "a"])
+    _write_children(vault, "/", ["Zeta", "alpha"])
+    # Case-sensitive binary ordering: uppercase precedes lowercase.
+    result = list_entries(vault, "/")
+    assert [e.path for e in result.entries] == ["/Zeta", "/alpha", "/dir"]
+
+
+def test_listing_uses_unicode_and_dot_names(vault):
+    with vault.transaction(write=True):
+        ensure_directories(vault.connection, "/.hidden")
+    _write_children(vault, "/", ["\u00e9clair", ".secret", "\u4e2d\u6587"])
+    result = list_entries(vault, "/")
+    paths = [e.path for e in result.entries]
+    assert "/.secret" in paths  # dot names are ordinary, not hidden
+    assert "/\u00e9clair" in paths
+    assert "/\u4e2d\u6587" in paths
+    # Binary ordering: '.' (0x2E) precedes letters, uppercase precedes lowercase.
+    assert paths == sorted(paths)
+
+
+def test_listing_empty_directory_returns_no_entries(vault):
+    with vault.transaction(write=True):
+        ensure_directories(vault.connection, "/empty")
+    result = list_entries(vault, "/empty")
+    assert result.entries == []
+    assert result.has_more is False
+    assert result.next_offset is None
+
+
+def test_listing_empty_root_returns_no_entries(vault):
+    result = list_entries(vault, "/")
+    assert result.entries == []
+    assert result.has_more is False
+    assert result.next_offset is None
+
+
+def test_listing_more_than_100_children_pages(vault):
+    names = [f"file-{i:03d}" for i in range(150)]
+    _write_children(vault, "/", names)
+    first = list_entries(vault, "/", limit=100)
+    assert len(first.entries) == 100
+    assert first.has_more is True
+    assert first.next_offset == 100
+    # Paths on the first page are the binary-smallest 100.
+    ordered_paths = [e.path for e in first.entries]
+    assert ordered_paths == sorted(ordered_paths)
+
+
+def test_listing_last_page_omits_next_offset(vault):
+    names = [f"file-{i:03d}" for i in range(150)]
+    _write_children(vault, "/", names)
+    second = list_entries(vault, "/", limit=100, offset=100)
+    assert len(second.entries) == 50
+    assert second.has_more is False
+    assert second.next_offset is None
+
+
+def test_listing_with_offset_skips_entries(vault):
+    names = [f"n{i}" for i in range(10)]
+    _write_children(vault, "/", names)
+    result = list_entries(vault, "/", limit=3, offset=3)
+    assert [e.path for e in result.entries] == ["/n3", "/n4", "/n5"]
+    assert result.has_more is True
+    assert result.next_offset == 6
+
+
+def test_listing_past_end_returns_empty_page(vault):
+    _write_children(vault, "/", ["a", "b"])
+    result = list_entries(vault, "/", offset=10)
+    assert result.entries == []
+    assert result.has_more is False
+    assert result.next_offset is None
+
+
+def test_recursive_listing_includes_all_descendants(vault):
+    with vault.transaction(write=True):
+        ensure_directories(vault.connection, "/a/b/c")
+    _write_children(vault, "/a", ["d.txt"])
+    _write_children(vault, "/a/b", ["e.txt"])
+    _write_children(vault, "/a/b/c", ["f.txt"])
+    _write_children(vault, "/", ["root.txt"])
+    result = list_entries(vault, "/", recursive=True)
+    paths = [e.path for e in result.entries]
+    assert paths == sorted(paths)
+    assert paths == [
+        "/a",
+        "/a/b",
+        "/a/b/c",
+        "/a/b/c/f.txt",
+        "/a/b/e.txt",
+        "/a/d.txt",
+        "/root.txt",
+    ]
+    # Recursive discovery shows intermediate directories as navigable entries.
+    assert {e.path for e in result.entries if e.kind == "directory"} == {
+        "/a", "/a/b", "/a/b/c"
+    }
+
+
+def test_recursive_listing_omits_the_selected_directory(vault):
+    with vault.transaction(write=True):
+        ensure_directories(vault.connection, "/a/b")
+    _write_children(vault, "/a", ["x"])
+    result = list_entries(vault, "/a/b", recursive=True)
+    assert result.entries == []
+    assert result.has_more is False
+    assert result.next_offset is None
+
+
+def test_recursive_listing_default_is_immediate(vault):
+    with vault.transaction(write=True):
+        ensure_directories(vault.connection, "/a/b")
+    _write_children(vault, "/", ["deep"])
+    result = list_entries(vault, "/")
+    assert [e.path for e in result.entries] == ["/a", "/deep"]
+
+
+def test_listing_a_file_is_a_conflict(vault):
+    # A file cannot be listed: resolve yields a non-directory row.
+    memhub.write_file(vault, "/note", "leaf")
+    with pytest.raises(Conflict) as conflict:
+        list_entries(vault, "/note")
+    assert conflict.value.code == "not_a_directory"
+
+
+def test_listing_missing_path_raises_missing(vault):
+    with pytest.raises(Missing):
+        list_entries(vault, "/nope")
+
+
+@pytest.mark.parametrize("bad_limit", [0, -1, -100])
+def test_listing_invalid_limit_rejected(vault, bad_limit):
+    with pytest.raises(InvalidInput):
+        list_entries(vault, "/", limit=bad_limit)
+
+
+@pytest.mark.parametrize("bad_offset", [-1, -50])
+def test_listing_invalid_offset_rejected(vault, bad_offset):
+    with pytest.raises(InvalidInput):
+        list_entries(vault, "/", offset=bad_offset)
+
+
+@pytest.mark.parametrize("bad_limit", [True, False, 1.5, "10", None])
+def test_listing_non_integer_limit_rejected(vault, bad_limit):
+    with pytest.raises(InvalidInput):
+        list_entries(vault, "/", limit=bad_limit)
+
+
+@pytest.mark.parametrize("bad_offset", [True, 2.0, "0"])
+def test_listing_non_integer_offset_rejected(vault, bad_offset):
+    with pytest.raises(InvalidInput):
+        list_entries(vault, "/", offset=bad_offset)
+
+
+def test_listing_result_is_immutable(vault):
+    _write_children(vault, "/", ["a"])
+    result = list_entries(vault, "/")
+    with pytest.raises(AttributeError):
+        result.has_more = True
+
+
+def test_immediate_listing_uses_sibling_index(vault):
+    ensure_directories(vault.connection, "/a")
+    plan = vault.connection.execute(
+        "EXPLAIN QUERY PLAN "
+        "SELECT * FROM entries WHERE parent_id = ? ORDER BY name LIMIT ? OFFSET ?",
+        (1, 2, 0),
+    ).fetchall()
+    detail = " ".join(str(step["detail"]) for step in plan)
+    assert "INDEX" in detail
+
+
+def test_recursive_listing_uses_sibling_index_for_child_lookup(vault):
+    ensure_directories(vault.connection, "/a/b")
+    plan = vault.connection.execute(
+        "EXPLAIN QUERY PLAN "
+        "WITH RECURSIVE subtree AS ("
+        "  SELECT id, parent_id, name, kind, content, created_at, updated_at, "
+        "         CAST('/' || name AS TEXT) AS vpath "
+        "  FROM entries WHERE parent_id = 1 "
+        "  UNION ALL "
+        "  SELECT e.id, e.parent_id, e.name, e.kind, e.content, e.created_at, e.updated_at, "
+        "         sp.vpath || '/' || e.name "
+        "  FROM entries e JOIN subtree sp ON e.parent_id = sp.id"
+        ") SELECT * FROM subtree ORDER BY vpath LIMIT 5 OFFSET 0",
+    ).fetchall()
+    detail = " ".join(str(step["detail"]) for step in plan)
+    assert "INDEX" in detail
