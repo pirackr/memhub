@@ -29,3 +29,89 @@ CREATE UNIQUE INDEX entries_sibling_unique
 -- most one row is the root and every other row is NULL (and therefore allowed).
 CREATE UNIQUE INDEX entries_root_unique
     ON entries ((CASE WHEN parent_id IS NULL THEN 1 ELSE NULL END));
+
+-- Row triggers fill the gaps a declarative constraint cannot: they can compare
+-- a new row against its parent, reject identity changes on update, and guard
+-- the root from deletion. Every trigger aborts the surrounding statement, which
+-- the storage layer surfaces as a typed Conflict (exit status 4).
+
+-- A child's parent must exist (foreign key) and be a directory. A row under a
+-- file, or under a non-existent parent, is rejected; the root has no parent
+-- and slips past this trigger untouched.
+CREATE TRIGGER entries_parent_kind
+    BEFORE INSERT ON entries
+    FOR EACH ROW
+    WHEN NEW.parent_id IS NOT NULL
+        AND NOT EXISTS (
+            SELECT 1 FROM entries WHERE id = NEW.parent_id AND kind = 'directory'
+        )
+    BEGIN
+        SELECT RAISE(ABORT, 'parent must be a directory');
+    END;
+
+-- Kinds are closed: a row is a file or a directory. V1 excludes symlinks and
+-- hard links entirely, so ``link`` and anything else is a corrupt write,
+-- whether it arrives through the storage library or raw SQL.
+CREATE TRIGGER entries_kind_check
+    BEFORE INSERT ON entries
+    FOR EACH ROW
+    WHEN NEW.kind NOT IN ('file', 'directory')
+    BEGIN
+        SELECT RAISE(ABORT, 'invalid entry kind');
+    END;
+
+-- Only files store content; directories must leave it NULL. A non-NULL
+-- content column on a non-file entry is an invalid write.
+CREATE TRIGGER entries_content_kind
+    BEFORE INSERT ON entries
+    FOR EACH ROW
+    WHEN NEW.content IS NOT NULL AND NEW.kind <> 'file'
+    BEGIN
+        SELECT RAISE(ABORT, 'content requires a file kind');
+    END;
+
+-- Non-root entries must carry a usable name. The root keeps an empty name by
+-- definition, so this trigger only fires for children.
+CREATE TRIGGER entries_name_check
+    BEFORE INSERT ON entries
+    FOR EACH ROW
+    WHEN NEW.parent_id IS NOT NULL AND (NEW.name IS NULL OR NEW.name = '')
+    BEGIN
+        SELECT RAISE(ABORT, 'entry name may not be empty');
+    END;
+
+-- An entry cannot reference itself as its parent.
+CREATE TRIGGER entries_self_parent
+    BEFORE UPDATE ON entries
+    FOR EACH ROW
+    WHEN NEW.parent_id = NEW.id
+    BEGIN
+        SELECT RAISE(ABORT, 'entry cannot be its own parent');
+    END;
+
+-- Identity is immutable once an entry exists: id, parent, name, kind, and the
+-- original created-at stamp never change. Every entry is protected the same
+-- way; the root is the same trigger's subject, so it cannot be relocated or
+-- retyped either.
+CREATE TRIGGER entries_identity_protect
+    BEFORE UPDATE OF id, parent_id, name, kind, created_at ON entries
+    FOR EACH ROW
+    WHEN NEW.id <> OLD.id
+        OR NEW.parent_id <> OLD.parent_id
+        OR NEW.name <> OLD.name
+        OR NEW.kind <> OLD.kind
+        OR NEW.created_at <> OLD.created_at
+    BEGIN
+        SELECT RAISE(ABORT, 'entry identity is immutable');
+    END;
+
+-- The root can never be deleted; every other entry's deletion is left to the
+-- caller so subtree removal can be planned explicitly.
+CREATE TRIGGER entries_root_delete_protect
+    BEFORE DELETE ON entries
+    FOR EACH ROW
+    WHEN OLD.parent_id IS NULL
+    BEGIN
+        SELECT RAISE(ABORT, 'the root entry cannot be deleted');
+    END;
+
