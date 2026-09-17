@@ -19,7 +19,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Optional
 
-__all__ = ["Entry", "WriteResult"]
+__all__ = ["Entry", "WriteResult", "ReadResult"]
 
 
 @dataclass(frozen=True)
@@ -50,3 +50,24 @@ class WriteResult:
 
     entry: Entry
     content_hash: str
+
+
+@dataclass(frozen=True)
+class ReadResult:
+    """The result of a :func:`memhub.documents.read_file` operation.
+
+    ``entry`` is the :class:`Entry` for the document that was read. ``content``
+    is the decoded slice returned to the caller; ``content_hash`` is the SHA-256
+    hex digest of the *complete* stored document, so a partial read never
+    changes it. ``start_line`` and ``end_line`` are the one-based inclusive
+    line range covered by ``content``; ``end_line`` is ``None`` when the range
+    is empty (for example a read past the end of the document). ``has_more``
+    reports whether additional lines remain after ``end_line``.
+    """
+
+    entry: Entry
+    content: str
+    content_hash: str
+    start_line: int
+    end_line: Optional[int]
+    has_more: bool

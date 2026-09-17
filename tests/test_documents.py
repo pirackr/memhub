@@ -18,7 +18,9 @@ import pytest
 import memhub
 from memhub.documents import (
     Entry,
+    ReadResult,
     WriteResult,
+    read_file,
     write_file,
     write_in_transaction,
 )
@@ -271,4 +273,233 @@ def test_write_normalizes_path_before_resolution(vault):
     # The input normalizes to the canonical leaf file ``/multi/path`` ...
     assert _entry_row(vault, "/multi/path")["name"] == "path"
     # ... and its parent ``multi`` has exactly one child (that file).
+    assert _entry_row(vault, "/multi/path")["name"] == "path"
+    # ... and its parent ``multi`` has exactly one child (that file).
     assert _count_under_parent(vault, "multi") == 1
+
+
+# --------------------------------------------------------------------------- #
+# Reads: whole documents, ranges, metadata, and boundaries
+# --------------------------------------------------------------------------- #
+
+
+def test_read_whole_document_returns_full_content_and_hash(vault):
+    write_file(vault, "/whole.txt", "a\nb\nc")
+    result = read_file(vault, "/whole.txt")
+
+    assert isinstance(result, ReadResult)
+    assert result.entry.kind == FILE
+    assert result.entry.path == "/whole.txt"
+    assert result.content == "a\nb\nc"
+    # Hashing covers the complete document.
+    assert result.content_hash == content_hash("a\nb\nc")
+    assert result.start_line == 1
+    assert result.end_line == 3
+    assert result.has_more is False
+
+
+def test_read_partial_range_identifies_returned_lines(vault):
+    write_file(vault, "/partial.txt", "a\nb\nc\nd\ne")
+    result = read_file(vault, "/partial.txt", start_line=1, lines=2)
+
+    assert result.content == "a\nb\n"
+    assert result.start_line == 1
+    assert result.end_line == 2
+    assert result.has_more is True
+    # A partial read still hashes the complete document.
+    assert result.content_hash == content_hash("a\nb\nc\nd\ne")
+
+
+def test_read_partial_range_from_offset(vault):
+    write_file(vault, "/offset.txt", "a\nb\nc\nd")
+    result = read_file(vault, "/offset.txt", start_line=2, lines=2)
+
+    assert result.content == "b\nc\n"
+    assert result.start_line == 2
+    assert result.end_line == 3
+    assert result.has_more is True
+    assert result.content_hash == content_hash("a\nb\nc\nd")
+
+
+def test_read_past_end_returns_empty_content_with_null_end_line(vault):
+    write_file(vault, "/end.txt", "a\nb\nc")
+    result = read_file(vault, "/end.txt", start_line=5, lines=3)
+
+    assert result.content == ""
+    assert result.start_line == 5
+    assert result.end_line is None
+    assert result.has_more is False
+    # The document still exists and is hashed in full.
+    assert result.content_hash == content_hash("a\nb\nc")
+
+
+def test_read_count_beyond_end_is_clamped_without_more(vault):
+    write_file(vault, "/clamp.txt", "a\nb\nc")
+    result = read_file(vault, "/clamp.txt", start_line=2, lines=50)
+
+    assert result.content == "b\nc"
+    assert result.start_line == 2
+    assert result.end_line == 3
+    assert result.has_more is False
+    assert result.content_hash == content_hash("a\nb\nc")
+
+
+def test_read_no_final_newline_has_no_artificial_empty_line(vault):
+    write_file(vault, "/nonl.txt", "a\nb")
+    result = read_file(vault, "/nonl.txt")
+
+    assert result.content == "a\nb"
+    assert result.end_line == 2
+    assert result.has_more is False
+
+    # The whole document has exactly two lines; there is no trailing empty one.
+    assert read_file(vault, "/nonl.txt", start_line=1, lines=2).content == "a\nb"
+
+
+def test_read_trailing_newline_adds_no_extra_empty_line(vault):
+    write_file(vault, "/trail.txt", "a\nb\n")
+    result = read_file(vault, "/trail.txt")
+
+    # The trailing newline is part of line 2's content, not a third empty line.
+    assert result.content == "a\nb\n"
+    assert result.end_line == 2
+    assert result.has_more is False
+
+    # Reading the final line keeps its trailing newline exactly.
+    last = read_file(vault, "/trail.txt", start_line=2)
+    assert last.content == "b\n"
+    assert last.start_line == 2
+    assert last.end_line == 2
+
+    # One line past the end is an empty range, not a missing document.
+    past = read_file(vault, "/trail.txt", start_line=3)
+    assert past.content == ""
+    assert past.end_line is None
+
+
+def test_read_single_middle_line_round_trips(vault):
+    write_file(vault, "/mid.txt", "a\nb\nc")
+    # A line-range read reproduces the exact stored substring, so the middle
+    # line keeps its terminating newline (and the read reports one more line
+    # remains).
+    only = read_file(vault, "/mid.txt", start_line=2, lines=1)
+    assert only.content == "b\n"
+    assert only.start_line == 2
+    assert only.end_line == 2
+    assert only.has_more is True
+
+
+def test_read_from_offset_to_end(vault):
+    write_file(vault, "/tail.txt", "a\nb\nc")
+    tail = read_file(vault, "/tail.txt", start_line=2)
+    assert tail.content == "b\nc"
+    assert tail.start_line == 2
+    assert tail.end_line == 3
+    assert tail.has_more is False
+
+
+def test_read_crlf_content_preserves_carriage_returns(vault):
+    body = "x\r\ny\r\nz"
+    write_file(vault, "/crlf.txt", body)
+
+    whole = read_file(vault, "/crlf.txt")
+    assert whole.content == body
+    assert whole.end_line == 3
+
+    # The first logical line keeps its CR before the LF; slicing adds only the
+    # LF separator between lines.
+    first = read_file(vault, "/crlf.txt", start_line=1, lines=1)
+    assert first.content == "x\r\n"
+    assert first.start_line == 1
+    assert first.end_line == 1
+    assert first.has_more is True
+    assert first.content_hash == content_hash(body)
+
+    # The second line keeps its trailing CR too.
+    second = read_file(vault, "/crlf.txt", start_line=2, lines=1)
+    assert second.content == "y\r\n"
+
+
+def test_read_empty_file_is_empty_range(vault):
+    write_file(vault, "/empty.txt", "")
+    result = read_file(vault, "/empty.txt")
+
+    assert result.content == ""
+    assert result.start_line == 1
+    assert result.end_line is None
+    assert result.has_more is False
+    assert result.content_hash == content_hash("")
+
+    # Reading past the (nonexistent) end of an empty file is equally empty.
+    past = read_file(vault, "/empty.txt", start_line=10)
+    assert past.content == ""
+    assert past.end_line is None
+
+
+def test_read_missing_path_raises_missing(vault):
+    with pytest.raises(Missing):
+        read_file(vault, "/does/not/exist.txt")
+
+
+def test_read_directory_raises_conflict(vault):
+    # Create a directory by writing a file beneath it.
+    write_file(vault, "/adir/child.txt", "x")
+    with pytest.raises(Conflict) as conflicted:
+        read_file(vault, "/adir")
+    assert conflicted.value.code == "read_directory"
+
+
+@pytest.mark.parametrize(
+    "start_line,lines,code",
+    [
+        (0, None, "invalid_start_line"),
+        (-1, None, "invalid_start_line"),
+        (-100, None, "invalid_start_line"),
+        (1, 0, "invalid_lines"),
+        (1, -1, "invalid_lines"),
+        (2, -50, "invalid_lines"),
+    ],
+)
+def test_read_invalid_range_arguments_raise_invalid_input(vault, start_line, lines, code):
+    write_file(vault, "/bad.txt", "a\nb\nc")
+    with pytest.raises(InvalidInput) as invalid:
+        read_file(vault, "/bad.txt", start_line=start_line, lines=lines)
+    assert invalid.value.code == code
+
+
+@pytest.mark.parametrize(
+    "start_line,lines",
+    [
+        (1.5, None),
+        (1.0, None),
+        (1, 2.5),
+        ("1", None),
+        (1, "2"),
+        (True, None),
+        (1, False),
+    ],
+)
+def test_read_non_integer_range_arguments_raise_invalid_input(
+    vault, start_line, lines
+):
+    write_file(vault, "/nonint.txt", "a\nb\nc")
+    with pytest.raises(InvalidInput) as invalid:
+        read_file(vault, "/nonint.txt", start_line=start_line, lines=lines)
+    # A boolean is an int subclass but is not an acceptable line number.
+    assert invalid.value.code in ("invalid_start_line", "invalid_lines")
+
+
+def test_read_normalizes_path_before_resolution(vault):
+    write_file(vault, "/doc/notes.txt", "a\nb")
+    result = read_file(vault, "/doc//notes.txt/")
+    assert result.entry.path == "/doc/notes.txt"
+    assert result.content == "a\nb"
+
+
+def test_read_reports_complete_utf8_size_on_partial_read(vault):
+    # "caf\u00e9\n" is 5 characters but 6 UTF-8 bytes; a partial read must still
+    # report the size of the whole document, not the slice.
+    write_file(vault, "/size.txt", "caf\u00e9\nsecond\n")
+    result = read_file(vault, "/size.txt", start_line=1, lines=1)
+    assert result.entry.size_bytes == len("caf\u00e9\nsecond\n".encode("utf-8"))
+    assert result.content == "caf\u00e9\n"

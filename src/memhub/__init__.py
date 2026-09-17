@@ -19,7 +19,9 @@ from .errors import (
 )
 from .documents import (
     Entry,
+    ReadResult,
     WriteResult,
+    read_file,
     write_file,
     write_in_transaction,
 )
@@ -30,9 +32,11 @@ __all__ = [
     "create_vault",
     "open_vault",
     "Entry",
+    "ReadResult",
     "WriteResult",
     "write_file",
     "write_in_transaction",
+    "read_file",
     "MemhubError",
     "InvalidInput",
     "Missing",

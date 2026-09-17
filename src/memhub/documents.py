@@ -17,6 +17,12 @@ compute the document hash (see :func:`memhub.text.content_hash`), create missing
 parent directories atomically, and honor the mutually exclusive
 ``if_match`` / ``if_absent`` conditions.
 
+:func:`read_file` returns a whole document or a one-based line range through a
+single snapshot transaction. Lines are separated by LF only; carriage returns
+are preserved, no text is normalized, and a trailing newline adds no empty
+line. The reported hash covers the complete stored document even for a partial
+read.
+
 The storage library neither starts nor commits the surrounding transaction in
 :func:`write_in_transaction`; the caller owns those boundaries. In
 :func:`write_file` the :class:`~memhub.Vault` transaction owns them and rolls
@@ -28,8 +34,8 @@ from __future__ import annotations
 import sqlite3
 from typing import TYPE_CHECKING, Optional, Tuple
 
-from .errors import Conflict, Missing
-from .models import Entry, WriteResult
+from .errors import Conflict, InvalidInput, Missing
+from .models import Entry, ReadResult, WriteResult
 from .paths import normalize_path
 from .text import content_hash, validate_text
 from .tree import DIRECTORY, FILE, ensure_directories, resolve
@@ -39,7 +45,9 @@ if TYPE_CHECKING:
 
 __all__ = [
     "Entry",
+    "ReadResult",
     "WriteResult",
+    "read_file",
     "write_file",
     "write_in_transaction",
 ]
@@ -214,6 +222,136 @@ def write_file(
             content,
             if_match=if_match,
             if_absent=if_absent,
+        )
+
+
+def _validate_range(
+    start_line: int, lines: Optional[int]
+) -> Tuple[int, Optional[int]]:
+    """Validate the one-based line-range arguments of :func:`read_file`.
+
+    ``start_line`` must be a positive integer. ``lines`` is optional but, when
+    present, must also be a positive integer. ``bool`` is rejected even though
+    it is an ``int`` subclass. Raises :class:`InvalidInput` otherwise; the
+    arguments are returned unchanged on success.
+    """
+    if isinstance(start_line, bool) or not isinstance(start_line, int):
+        raise InvalidInput(
+            "invalid_start_line",
+            "start_line must be an integer",
+        )
+    if start_line < 1:
+        raise InvalidInput(
+            "invalid_start_line",
+            f"start_line must be at least 1, got {start_line}",
+        )
+    if lines is not None:
+        if isinstance(lines, bool) or not isinstance(lines, int):
+            raise InvalidInput(
+                "invalid_lines",
+                "lines must be an integer",
+            )
+        if lines < 1:
+            raise InvalidInput(
+                "invalid_lines",
+                f"lines must be at least 1, got {lines}",
+            )
+    return start_line, lines
+
+
+def _line_starts(content: str) -> tuple[int, list[int]]:
+    """Return ``(total_lines, line_starts)`` for ``content``.
+
+    ``line_starts[k]`` is the character offset at which line ``k + 1`` (1-based)
+    begins. ``total_lines`` is the number of lines: an empty document has zero,
+    and a trailing line feed does not add a final empty line. Every returned
+    start is a real line start, so the substring for line ``L`` is
+    ``content[line_starts[L - 1]:<next start or len(content)>``.
+    """
+    if content == "":
+        return 0, []
+    starts = [0]
+    for index, char in enumerate(content):
+        if char == "\n":
+            starts.append(index + 1)
+    # A trailing newline pushes a final start equal to len(content); that is the
+    # dropped empty line, so drop it and treat len(content) as the last line end.
+    if content.endswith("\n"):
+        starts.pop()
+    return len(starts), starts
+
+
+def read_file(
+    vault: "Vault",
+    path: str,
+    start_line: int = 1,
+    lines: Optional[int] = None,
+) -> ReadResult:
+    """Read a whole document or a one-based line range from ``path``.
+
+    ``start_line`` is one-based and defaults to ``1``. ``lines`` is an optional
+    positive count; when ``None`` the remainder of the document from
+    ``start_line`` is returned. The line range is clamped to the document, so a
+    ``start_line`` past the end (or an ``lines`` count beyond the end) returns
+    empty content with a null ``end_line`` rather than an error.
+
+    The document is read through a single snapshot (``BEGIN``) transaction so
+    the resolved row and its content are seen together. Text is returned exactly
+    as stored: lines are separated by LF only, carriage returns are preserved,
+    no normalization is applied, and a trailing newline is part of the last
+    line rather than an appended empty line. The returned
+    :class:`ReadResult.content_hash` covers the *complete* stored document even
+    for a partial read.
+
+    The path is normalized before resolution. A missing path raises
+    :class:`Missing`; reading a directory raises :class:`Conflict`. A
+    ``start_line`` below ``1`` or a non-positive / non-integer ``lines`` raises
+    :class:`InvalidInput`.
+    """
+    canonical = normalize_path(path)
+    start_line, lines = _validate_range(start_line, lines)
+
+    with vault.transaction(write=False):
+        row = resolve(vault.connection, canonical)
+        if row["kind"] != FILE:
+            raise Conflict(
+                "read_directory",
+                f"path {canonical!r} is a directory, not a file",
+            )
+
+        content = row["content"] if row["content"] is not None else ""
+        total_lines, line_starts = _line_starts(content)
+        entry = _entry_from_row(row, canonical)
+
+        if start_line > total_lines:
+            # An empty range: no lines returned and the range end is unknown.
+            return ReadResult(
+                entry=entry,
+                content="",
+                content_hash=content_hash(content),
+                start_line=start_line,
+                end_line=None,
+                has_more=False,
+            )
+
+        if lines is not None:
+            requested_end = start_line + lines - 1
+        else:
+            requested_end = total_lines
+        has_more = requested_end < total_lines
+        end_line = requested_end if has_more else total_lines
+
+        start_offset = line_starts[start_line - 1]
+        end_offset = len(content) if not has_more else line_starts[end_line]
+        body = content[start_offset:end_offset]
+
+        return ReadResult(
+            entry=entry,
+            content=body,
+            content_hash=content_hash(content),
+            start_line=start_line,
+            end_line=end_line,
+            has_more=has_more,
         )
 
 
