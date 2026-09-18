@@ -19,7 +19,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Optional
 
-__all__ = ["Entry", "WriteResult", "ReadResult", "ListResult"]
+__all__ = ["Entry", "WriteResult", "ReadResult", "ListResult", "Edit"]
 
 
 @dataclass(frozen=True)
@@ -87,3 +87,22 @@ class ListResult:
     entries: list[Entry]
     has_more: bool
     next_offset: Optional[int]
+
+
+@dataclass(frozen=True)
+class Edit:
+    """A single exact-text replacement operation.
+
+    ``old_text`` is the literal, case-sensitive substring that must appear in
+    the original document; ``new_text`` is the replacement (which may be empty).
+    Matching is by exact character sequence, including whitespace and newlines.
+
+    ``replace_all`` selects every non-overlapping occurrence of ``old_text`` when
+    true. When false (the default) the operation must match exactly one
+    occurrence; more than one is an ambiguous conflict. Neither field is
+    otherwise interpreted, escaped, or normalized.
+    """
+
+    old_text: str
+    new_text: str
+    replace_all: bool = False
