@@ -64,7 +64,7 @@ V1 does not reparent or rename existing rows. Existing IDs, names, parent links,
 
 `created_at` is preserved on overwrites. Content mutations update the file timestamp; creation/deletion updates the directly affected directory timestamps, not every ancestor. Timestamps are informational, not concurrency tokens.
 
-Store the schema version in SQLite `user_version` and initialize the database with UTF-8 encoding. Opening a vault validates its identity/schema version; an unrelated SQLite database or unsupported version is an error. Normal operations never initialize or migrate a vault implicitly.
+Store the schema version in SQLite `user_version` and initialize the database with UTF-8 encoding. Fast opening validates identity/schema version, exact canonical schema and columns, and the unique canonical root; an unrelated SQLite database, schema lookalike, or unsupported version is an error. It deliberately does not scan every page, foreign key, or entry, so a successful normal open is not full integrity certification. Library callers use `audit_vault(path)` or `open_vault(path, audit=True)`, and CLI callers use global `--verify`, for exhaustive SQLite integrity, foreign-key, and tree-invariant validation. Audit is required for untrusted or suspected-corrupt data. Constraints protect writes made through normal connections but do not prove that already-stored data is uncorrupted. Normal operations never initialize or migrate a vault implicitly.
 
 ### Virtual path rules
 
@@ -93,14 +93,14 @@ The host vault file's OS permissions are the access boundary. There is no docume
 Global syntax:
 
 ```text
-memhub --vault HOST_DATABASE [--json] COMMAND ...
+memhub --vault HOST_DATABASE [--json] [--verify] COMMAND ...
 ```
 
 `--vault` is explicit and identifies a host filesystem path. Other document paths are virtual unless a command explicitly accepts a host import source. No implicit vault discovery or persistent virtual working directory is needed in v1.
 
 | Command | V1 behavior |
 | --- | --- |
-| `init` | Exclusively create a vault; never overwrite an existing file. The host parent directory must already exist. |
+| `init` | Exclusively create a vault; never overwrite an existing file. The host parent directory must already exist. With global `--verify`, audit the newly created vault before reporting success. |
 | `ls [PATH]` | List children of a directory, defaulting to `/`. `--recursive` includes descendants. Return paths, kinds, timestamps, and file size in UTF-8 bytes. |
 | `read PATH` | Read a file, optionally with `--start-line` and `--lines`. JSON includes entry metadata and the hash of the complete content, even for a partial read. |
 | `write PATH` | Create/replace a file from strict UTF-8 stdin and create missing parents atomically. Support `--if-match HASH` and `--if-absent`, which are mutually exclusive. |
@@ -206,7 +206,7 @@ Tests cover both the library and subprocess CLI contract:
 - Directory import mapping, collisions, empty directories, atomic rollback, and encoding summaries.
 - Skill examples matching the shipped CLI.
 
-Tests run only against disposable fixtures. Invariant checks and SQLite integrity checks after mutation/failure scenarios supplement expected-output assertions.
+Tests run only against disposable fixtures. Explicit audits, including invariant and SQLite integrity checks after mutation/failure scenarios, supplement expected-output assertions; ordinary opening retains the documented fast checks and avoids exhaustive scans.
 
 ## 9. Performance evaluation
 

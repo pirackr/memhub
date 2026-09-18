@@ -1,0 +1,28 @@
+# --- Python interpreter and build caches ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# --- Isolated virtual environments ---
+.venv/
+venv/
+env/
+
+# --- memhub disposable vaults and SQLite sidecars ---
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+
+# --- Generated benchmark corpora (JSON evidence remains trackable) ---
+/memhub_vaults/
+benchmarks/corpus/
+
+# --- Local scratch ---
+_probe.py

@@ -1,0 +1,149 @@
+"""Result records for memhub storage-library operations.
+
+These are the immutable value types the storage library returns to callers.
+They intentionally mirror the columns a :class:`sqlite3.Row` exposes, but carry
+an explicit virtual ``path`` (which the adjacency-list schema never stores) and
+drop columns the public surface does not publish (the parent id, the content
+itself, etc.).
+
+The records are frozen dataclasses so a caller cannot mutate a value it was
+handed; a fresh record is built for every operation result.
+
+Neither record touches the host filesystem or decodes bytes. Sizes are UTF-8
+byte counts, never character counts, matching the spec's "Entry size means
+UTF-8 byte count" rule.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Optional
+
+__all__ = ["Entry", "WriteResult", "ReadResult", "ListResult", "Edit", "DecodedText", "SourceItem", "ImportWarning", "ImportResult"]
+
+
+@dataclass(frozen=True)
+class Entry:
+    """A published view of a single vault entry.
+
+    ``id`` is the integer primary key. ``path`` is the canonical virtual path of
+    the entry. ``kind`` is ``"file"`` or ``"directory"``. ``size_bytes`` is the
+    UTF-8 byte count of a file's content, or ``None`` for a directory.
+    ``created_at`` and ``updated_at`` are UTC ISO-8601 strings.
+    """
+
+    id: int
+    path: str
+    kind: str
+    size_bytes: Optional[int]
+    created_at: str
+    updated_at: str
+
+
+@dataclass(frozen=True)
+class WriteResult:
+    """The result of a document write.
+
+    ``entry`` is the resulting :class:`Entry`; ``content_hash`` is the SHA-256
+    hex digest of the complete written content.
+    """
+
+    entry: Entry
+    content_hash: str
+
+
+@dataclass(frozen=True)
+class ReadResult:
+    """The result of a :func:`memhub.documents.read_file` operation.
+
+    ``entry`` is the :class:`Entry` for the document that was read. ``content``
+    is the decoded slice returned to the caller; ``content_hash`` is the SHA-256
+    hex digest of the *complete* stored document, so a partial read never
+    changes it. ``start_line`` and ``end_line`` are the one-based inclusive
+    line range covered by ``content``; ``end_line`` is ``None`` when the range
+    is empty (for example a read past the end of the document). ``has_more``
+    reports whether additional lines remain after ``end_line``.
+    """
+
+    entry: Entry
+    content: str
+    content_hash: str
+    start_line: int
+    end_line: Optional[int]
+    has_more: bool
+
+
+@dataclass(frozen=True)
+class ListResult:
+    """The result of a :func:`memhub.tree.list_entries` operation.
+
+    ``entries`` are the :class:`Entry` views of the directory's immediate
+    children (or, for a recursive listing, every descendant). ``has_more``
+    reports whether further entries remain past this page. ``next_offset`` is
+    the zero-based offset to pass for the following page, or ``None`` on the
+    final page where no continuation exists.
+    """
+
+    entries: list[Entry]
+    has_more: bool
+    next_offset: Optional[int]
+
+
+@dataclass(frozen=True)
+class Edit:
+    """A single exact-text replacement operation.
+
+    ``old_text`` is the literal, case-sensitive substring that must appear in
+    the original document; ``new_text`` is the replacement (which may be empty).
+    Matching is by exact character sequence, including whitespace and newlines.
+
+    ``replace_all`` selects every non-overlapping occurrence of ``old_text`` when
+    true. When false (the default) the operation must match exactly one
+    occurrence; more than one is an ambiguous conflict. Neither field is
+    otherwise interpreted, escaped, or normalized.
+    """
+
+    old_text: str
+    new_text: str
+    replace_all: bool = False
+
+
+@dataclass(frozen=True)
+class SourceItem:
+    """One safely opened host source item."""
+
+    source_path: str
+    relative_path: str
+    kind: str
+    data: Optional[bytes] = None
+
+
+@dataclass(frozen=True)
+class ImportWarning:
+    source_path: str
+    encoding: str
+    message: str
+    confidence: float
+
+
+@dataclass(frozen=True)
+class ImportResult:
+    files: int
+    directories: int
+    encoding_counts: dict[str, int]
+
+
+@dataclass(frozen=True)
+class DecodedText:
+    """The result of :func:`memhub.encoding.decode_bytes`.
+
+    ``text`` is the fully decoded Unicode content with any consumed signature
+    BOM removed. ``encoding`` is the canonical codec label (for example
+    ``"utf-8"``, ``"utf-16-le"``, ``"cp1252"``). ``confidence`` is a 0.0-1.0
+    float: deterministic BOM and UTF-8 inputs report ``1.0``; detector guesses
+    report the detector's confidence.
+    """
+
+    text: str
+    encoding: str
+    confidence: float
