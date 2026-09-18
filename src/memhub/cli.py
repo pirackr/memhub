@@ -12,7 +12,7 @@ from .edits import parse_edits
 from .errors import InvalidInput, MemhubError
 from .importer import import_source
 from .tree import list_entries, remove_entry
-from .vault import create_vault, open_vault
+from .vault import audit_vault, create_vault, open_vault
 
 API_VERSION = 1
 
@@ -25,6 +25,7 @@ def _parser():
     p=Parser(prog="memhub")
     p.add_argument("--vault", required=True)
     p.add_argument("--json", action="store_true")
+    p.add_argument("--verify", action="store_true", help="run a full integrity audit before the command")
     sub=p.add_subparsers(dest="command", required=True)
     sub.add_parser("init")
     ls=sub.add_parser("ls"); ls.add_argument("path",nargs="?",default="/"); ls.add_argument("--recursive",action="store_true"); ls.add_argument("--limit",type=int,default=100); ls.add_argument("--offset",type=int,default=0)
@@ -70,9 +71,12 @@ def main(argv=None):
         if args.command == 'ls' and (args.limit > 2**63 - 1 or args.offset > 2**63 - 1):
             raise InvalidInput('invalid_pagination', 'limit and offset exceed the supported range')
         if args.command=="init":
-            create_vault(Path(args.vault)); result=None
+            create_vault(Path(args.vault))
+            if args.verify:
+                audit_vault(Path(args.vault))
+            result=None
         else:
-            with open_vault(Path(args.vault)) as vault:
+            with open_vault(Path(args.vault), audit=args.verify) as vault:
                 if args.command=="ls": result=list_entries(vault,args.path,args.recursive,args.limit,args.offset)
                 elif args.command=="read":
                     result=read_file(vault,args.path,args.start_line,args.lines)

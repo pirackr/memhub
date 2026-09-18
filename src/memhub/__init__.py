@@ -29,12 +29,13 @@ from .documents import (
 from .models import Edit, ListResult, ImportResult, ImportWarning
 from .importer import import_source
 from .tree import list_entries, remove_entry
-from .vault import Vault, create_vault, open_vault
+from .vault import Vault, audit_vault, create_vault, open_vault
 
 __all__ = [
     "Vault",
     "create_vault",
     "open_vault",
+    "audit_vault",
     "Entry",
     "ReadResult",
     "WriteResult",

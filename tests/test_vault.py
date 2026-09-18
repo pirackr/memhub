@@ -274,11 +274,104 @@ def test_schema_rejects_direct_invalid_rows_and_updates(host_dir):
             vault.connection.execute("UPDATE entries SET content='bad' WHERE parent_id IS NULL")
 
 
+def test_fast_open_avoids_exhaustive_scans_and_audit_finds_corruption(host_dir):
+    path = host_dir / 'vault.db'
+    memhub.create_vault(path)
+    raw = sqlite3.connect(path)
+    raw.execute('PRAGMA foreign_keys = OFF')
+    raw.execute("INSERT INTO entries(parent_id,name,kind,content,created_at,updated_at) VALUES(1,'gone','directory',NULL,'t','t')")
+    parent = raw.execute("SELECT id FROM entries WHERE name='gone'").fetchone()[0]
+    raw.execute("INSERT INTO entries(parent_id,name,kind,content,created_at,updated_at) VALUES(?,'orphan','file','x','t','t')", (parent,))
+    raw.execute('DELETE FROM entries WHERE id=?', (parent,))
+    raw.commit()
+    raw.close()
+
+    with memhub.open_vault(path) as vault:
+        statements = []
+        vault.connection.set_trace_callback(statements.append)
+        # Normal use remains available because fast open certifies identity,
+        # canonical schema, and the root rather than all stored rows/pages.
+        assert vault.connection.execute('SELECT 1').fetchone()[0] == 1
+        assert not any('integrity_check' in sql or 'foreign_key_check' in sql for sql in statements)
+    with pytest.raises(VaultFailure) as bad:
+        memhub.audit_vault(path)
+    assert bad.value.code == 'schema_validation_failed'
+    with pytest.raises(VaultFailure):
+        memhub.open_vault(path, audit=True)
+
+
 def test_open_rejects_missing_schema_object_and_bad_root(host_dir):
     path=host_dir/'vault.db'; memhub.create_vault(path)
     raw=sqlite3.connect(path); raw.execute('DROP TRIGGER entries_content_update'); raw.commit(); raw.close()
     with pytest.raises(VaultFailure) as bad: memhub.open_vault(path)
     assert bad.value.code=='schema_validation_failed'
+
+
+@pytest.mark.parametrize("extra_sql", [
+    "CREATE TABLE extra (value TEXT)",
+    "CREATE INDEX extra_index ON entries(updated_at)",
+    "CREATE TRIGGER extra_trigger AFTER INSERT ON entries BEGIN SELECT 1; END",
+])
+def test_open_rejects_extra_schema_objects(host_dir, extra_sql):
+    path = host_dir / 'vault.db'
+    memhub.create_vault(path)
+    raw = sqlite3.connect(path)
+    raw.execute(extra_sql)
+    raw.commit()
+    raw.close()
+    with pytest.raises(VaultFailure) as bad:
+        memhub.open_vault(path)
+    assert bad.value.code == 'schema_validation_failed'
+
+
+def test_audit_rejects_disconnected_cycle_in_deep_canonical_tree(host_dir):
+    path = host_dir / 'vault.db'
+    memhub.create_vault(path)
+    raw = sqlite3.connect(path)
+    stamp = 't'
+    parent = 1
+    for number in range(1205):
+        cursor = raw.execute(
+            "INSERT INTO entries(parent_id,name,kind,content,created_at,updated_at) "
+            "VALUES(?,?,'directory',NULL,?,?)",
+            (parent, f'd{number}', stamp, stamp),
+        )
+        parent = cursor.lastrowid
+    first = raw.execute("SELECT id FROM entries WHERE name='d0'").fetchone()[0]
+    trigger_sql = [row[0] for row in raw.execute(
+        "SELECT sql FROM sqlite_master WHERE type='trigger' "
+        "AND name IN ('entries_identity_protect','entries_self_parent') ORDER BY name"
+    )]
+    raw.execute('DROP TRIGGER entries_identity_protect')
+    raw.execute('DROP TRIGGER entries_self_parent')
+    raw.execute('UPDATE entries SET parent_id=? WHERE id=?', (parent, first))
+    for sql in trigger_sql:
+        raw.execute(sql)
+    raw.commit()
+    raw.close()
+
+    # The fixture again has the exact canonical schema and valid foreign keys;
+    # only root reachability exposes its disconnected cycle.
+    with memhub.open_vault(path):
+        pass
+    with pytest.raises(VaultFailure) as bad:
+        memhub.audit_vault(path)
+    assert bad.value.code == 'schema_validation_failed'
+
+
+def test_audit_accepts_reachable_tree_deeper_than_1200(host_dir):
+    path = host_dir / 'vault.db'
+    memhub.create_vault(path)
+    raw = sqlite3.connect(path)
+    parent = 1
+    for number in range(1205):
+        parent = raw.execute(
+            "INSERT INTO entries(parent_id,name,kind,content,created_at,updated_at) "
+            "VALUES(?,?,'directory',NULL,'t','t')", (parent, f'd{number}'),
+        ).lastrowid
+    raw.commit()
+    raw.close()
+    memhub.audit_vault(path)
 
 
 def test_open_rejects_named_noop_trigger_lookalike(host_dir):

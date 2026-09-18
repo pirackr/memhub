@@ -33,6 +33,7 @@ from .errors import Busy, Conflict, InvalidInput, MemhubError, Missing, VaultFai
 __all__ = [
     "create_vault",
     "open_vault",
+    "audit_vault",
     "Vault",
 ]
 
@@ -144,7 +145,7 @@ def _canonical_schema_objects() -> dict[tuple[str, str], str]:
         reference.close()
 
 
-def _assert_memhub_vault(conn: sqlite3.Connection) -> None:
+def _assert_memhub_vault(conn: sqlite3.Connection, *, audit: bool = False) -> None:
     app_id = conn.execute("PRAGMA application_id").fetchone()[0]
     if app_id != MEMHUB_APP_ID:
         raise VaultFailure(
@@ -162,10 +163,10 @@ def _assert_memhub_vault(conn: sqlite3.Connection) -> None:
         "WHERE name NOT LIKE 'sqlite_%' AND type IN ('table','index','trigger')"
     )}
     canonical = _canonical_schema_objects()
-    if any(objects.get(identity) != sql for identity, sql in canonical.items()):
+    if objects != canonical:
         raise VaultFailure(
             "schema_validation_failed",
-            "required schema objects are missing or differ from canonical definitions",
+            "schema object set differs from the exact canonical definitions",
         )
     columns = [(r[1], r[2], r[3], r[5]) for r in conn.execute("PRAGMA table_info(entries)")]
     expected = [('id', 'INTEGER', 0, 1), ('parent_id', 'INTEGER', 0, 0),
@@ -174,6 +175,13 @@ def _assert_memhub_vault(conn: sqlite3.Connection) -> None:
                 ('updated_at', 'TEXT', 1, 0)]
     if columns != expected:
         raise VaultFailure("schema_validation_failed", "entries columns do not match schema")
+    root = conn.execute(
+        "SELECT name, kind, content FROM entries WHERE parent_id IS NULL"
+    ).fetchall()
+    if len(root) != 1 or tuple(root[0]) != ('', 'directory', None):
+        raise VaultFailure("schema_validation_failed", "vault root is missing or invalid")
+    if not audit:
+        return
     integrity = conn.execute("PRAGMA integrity_check").fetchone()[0]
     foreign = conn.execute("PRAGMA foreign_key_check").fetchone()
     invalid = conn.execute("""SELECT COUNT(*) FROM entries WHERE
@@ -183,8 +191,17 @@ def _assert_memhub_vault(conn: sqlite3.Connection) -> None:
         (parent_id IS NOT NULL AND (name='' OR instr(name,'/')>0)) OR
         (parent_id IS NOT NULL AND NOT EXISTS
           (SELECT 1 FROM entries p WHERE p.id=entries.parent_id AND p.kind='directory'))""").fetchone()[0]
-    roots = conn.execute("SELECT COUNT(*) FROM entries WHERE parent_id IS NULL").fetchone()[0]
-    if integrity != 'ok' or foreign is not None or invalid or roots != 1:
+    # UNION (not UNION ALL) makes traversal terminate after at most one row per
+    # entry even if corruption has introduced a cycle. It therefore has no
+    # dependency on Python or SQLite recursion-depth limits for deep trees.
+    unreachable = conn.execute("""WITH RECURSIVE reachable(id) AS (
+        SELECT id FROM entries WHERE parent_id IS NULL
+        UNION
+        SELECT child.id FROM entries AS child
+        JOIN reachable AS parent ON child.parent_id = parent.id
+    )
+    SELECT (SELECT COUNT(*) FROM entries) - (SELECT COUNT(*) FROM reachable)""").fetchone()[0]
+    if integrity != 'ok' or foreign is not None or invalid or unreachable:
         raise VaultFailure("schema_validation_failed", "vault integrity or tree invariants failed")
 
 
@@ -264,8 +281,13 @@ def create_vault(path: PathLike) -> None:
         raise
 
 
-def open_vault(path: PathLike) -> "Vault":
+def open_vault(path: PathLike, *, audit: bool = False) -> "Vault":
     """Open and validate an existing vault, returning a :class:`Vault`.
+
+    Normal opening performs fast identity, version, canonical-schema, column,
+    and root checks. ``audit=True`` additionally scans database integrity,
+    foreign keys, and all tree invariants; use it for untrusted or suspected
+    corrupt data.
 
     Never uses create-on-open mode: a missing host raises :class:`Missing`
     without creating anything, and a non-SQLite file is rejected. The file's
@@ -281,7 +303,7 @@ def open_vault(path: PathLike) -> "Vault":
         conn = sqlite3.connect(uri, uri=True)
         conn.row_factory = sqlite3.Row
         _apply_connection_pragmas(conn)
-        _assert_memhub_vault(conn)
+        _assert_memhub_vault(conn, audit=audit)
     except BaseException as exc:
         if conn is not None:
             _safe_close(conn)
@@ -293,6 +315,12 @@ def open_vault(path: PathLike) -> "Vault":
             raise _translate_connection_error(exc) from exc
         raise
     return Vault(host, conn)
+
+
+def audit_vault(path: PathLike) -> None:
+    """Exhaustively validate an existing vault and close it."""
+    with open_vault(path, audit=True):
+        return None
 
 
 class Vault:

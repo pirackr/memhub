@@ -4,6 +4,7 @@ import json, os, platform, resource, shutil, sqlite3, statistics, subprocess, sy
 from pathlib import Path
 from memhub import create_vault,open_vault,import_source,list_entries,read_file,write_file,edit_file,remove_entry
 from memhub.models import Edit
+from memhub.encoding import decode_bytes
 from .corpus import generate_corpus,SMALL,SCALE
 from .filesystem import FilesystemStore
 
@@ -24,6 +25,17 @@ def _cpu():
             if line.startswith('model name'): return line.split(':',1)[1].strip()
     except OSError: pass
     return platform.processor() or 'unknown'
+def _storage(path):
+    result={'mount_source':'unknown','mount_target':'unknown','filesystem_type':'unknown','rotational':'unknown'}
+    try:
+        fields=subprocess.run(['findmnt','-no','SOURCE,TARGET,FSTYPE','-T',str(path)],capture_output=True,text=True,check=True).stdout.strip().split()
+        if len(fields) >= 3: result.update(mount_source=fields[0],mount_target=fields[1],filesystem_type=fields[2])
+        device=Path(result['mount_source']).name.rstrip('0123456789')
+        rotational=Path('/sys/class/block')/device/'queue/rotational'
+        if rotational.exists(): result['rotational']='rotational' if rotational.read_text().strip()=='1' else 'non-rotational'
+    except (OSError,subprocess.SubprocessError): pass
+    return result
+
 def _peak_rss(pid):
     try:
         for line in Path(f'/proc/{pid}/status').read_text().splitlines():
@@ -116,6 +128,17 @@ def run_profile(profile,seed,output):
                         tree=f'/bench/tree-cli-{mode}-{i}'; (write_file(vault,tree+'/x','x') if is_sql else fs.write_file(tree+'/x','x'))
                         elapsed,rss,j=_timed_cmd(cmd('rm',tree,'--recursive'),journal=str(vault_path)+'-journal' if is_sql else None); vals['subtree_delete'].append(elapsed); peak_child=max(peak_child,rss); peak_journal=max(peak_journal,j)
                     for op,v in vals.items(): metrics[mode][op]=_stats(v)
+        # Measure validation separately so operation timings expose open cost.
+        fast_open=[]
+        for _ in range(samples):
+            t=time.perf_counter()
+            with open_vault(vault_path): pass
+            fast_open.append(time.perf_counter()-t)
+        full_audit=[]
+        for _ in range(bulk_samples):
+            t=time.perf_counter()
+            with open_vault(vault_path,audit=True): pass
+            full_audit.append(time.perf_counter()-t)
         # Fresh-process bulk imports into fresh stores (setup excluded).
         sqlite_cli_bulk=[]; filesystem_cli_bulk=[]
         for sample in range(bulk_samples):
@@ -126,14 +149,19 @@ def run_profile(profile,seed,output):
             shutil.rmtree(cli_fs)
         metrics['sqlite_cli']['bulk_ingestion']=_stats(sqlite_cli_bulk)
         metrics['filesystem_cli']['bulk_ingestion']=_stats(filesystem_cli_bulk)
-        # Detector cost is separate from UTF-8 corpus ingestion.
-        legacy=work/'legacy'; legacy.mkdir();
-        for i in range(min(count,100)): (legacy/f'{i}.txt').write_bytes(('café %d'%i).encode('cp1252'))
-        dv=work/'detector.db'; create_vault(dv); t=time.perf_counter()
-        with open_vault(dv) as v: import_source(v,legacy,'/legacy')
+        # Decoding-only costs: file reads and all storage writes are outside the
+        # timer. Direct UTF-8 must not be mislabeled bulk ingestion.
+        utf8_seconds=0.0
+        for source in corpus.rglob('*'):
+            if source.is_file():
+                data=source.read_bytes(); t=time.perf_counter(); decode_bytes(data); utf8_seconds += time.perf_counter()-t
+        legacy_data=[('café %d'%i).encode('cp1252') for i in range(min(count,100))]
+        t=time.perf_counter()
+        for data in legacy_data: decode_bytes(data)
         detector_seconds=time.perf_counter()-t
-        env={'python':platform.python_version(),'sqlite':sqlite3.sqlite_version,'chardet':__import__('chardet').__version__,'platform':platform.platform(),'cpu':_cpu(),'logical_cpus':os.cpu_count(),'memory_bytes':os.sysconf('SC_PAGE_SIZE')*os.sysconf('SC_PHYS_PAGES'),'filesystem':subprocess.run(['stat','-f','-c','%T',str(work)],capture_output=True,text=True).stdout.strip() or 'unknown','cache_policy':'warm OS cache; no global cache dropping','durability':{'sqlite':'rollback journal DELETE, synchronous FULL, atomic transactions','filesystem':'file and parent-directory fsync per mutation; bulk is durable per file but not atomic'}}
-        report={'report_version':2,'profile':profile,'environment':env,'corpus':{'seed':seed,'document_count':manifest.document_count,'input_bytes':manifest.input_bytes},'metrics':metrics,'resources':{'runner_peak_rss_kib':resource.getrusage(resource.RUSAGE_SELF).ru_maxrss,'peak_cli_rss_kib':peak_child,'database_bytes':vault_path.stat().st_size,'filesystem_bytes':_size(fsroot),'peak_journal_bytes':peak_journal},'throughput':{'sqlite_library_documents_per_second':count/statistics.median(sqlite_bulk),'filesystem_library_documents_per_second':count/statistics.median(fs_bulk),'sqlite_cli_documents_per_second':count/statistics.median(sqlite_cli_bulk),'filesystem_cli_documents_per_second':count/statistics.median(filesystem_cli_bulk)},'encoding_detection':{'direct_utf8_documents':count,'direct_utf8_seconds':statistics.median(sqlite_bulk),'legacy_detector_documents':min(count,100),'legacy_detector_seconds':detector_seconds},'checks':{'sqlite_files':ir.files,'filesystem_files':fr.files,'hash_manifest_entries':len(manifest.documents)},'caveats':['Warm OS caches; fresh process does not imply cold cache.','Filesystem bulk import is durable per file but has no equivalent multi-file rollback.','Every ordinary operation has 30 samples and every bulk ingestion has three samples in every mode.'],'elapsed_seconds':time.perf_counter()-started}
+        storage=_storage(work)
+        env={'python':platform.python_version(),'sqlite':sqlite3.sqlite_version,'chardet':__import__('chardet').__version__,'platform':platform.platform(),'cpu':_cpu(),'logical_cpus':os.cpu_count(),'memory_bytes':os.sysconf('SC_PAGE_SIZE')*os.sysconf('SC_PHYS_PAGES'),'filesystem':storage['filesystem_type'],'storage':storage,'cache_policy':'warm OS cache; no global cache dropping','durability':{'sqlite':'rollback journal DELETE, synchronous FULL, atomic transactions','filesystem':'file and parent-directory fsync per mutation; bulk is durable per file but not atomic'}}
+        report={'report_version':2,'profile':profile,'environment':env,'corpus':{'seed':seed,'document_count':manifest.document_count,'input_bytes':manifest.input_bytes},'metrics':metrics,'validation_phases':{'fast_open':_stats(fast_open),'full_audit':_stats(full_audit)},'resources':{'runner_peak_rss_kib':resource.getrusage(resource.RUSAGE_SELF).ru_maxrss,'peak_cli_rss_kib':peak_child,'database_bytes':vault_path.stat().st_size,'filesystem_bytes':_size(fsroot),'peak_journal_bytes':peak_journal},'throughput':{'sqlite_library_documents_per_second':count/statistics.median(sqlite_bulk),'filesystem_library_documents_per_second':count/statistics.median(fs_bulk),'sqlite_cli_documents_per_second':count/statistics.median(sqlite_cli_bulk),'filesystem_cli_documents_per_second':count/statistics.median(filesystem_cli_bulk)},'encoding_detection':{'method':'decoding only; source reads and destination writes excluded','direct_utf8_documents':count,'direct_utf8_seconds':utf8_seconds,'legacy_detector_documents':len(legacy_data),'legacy_detector_seconds':detector_seconds},'checks':{'sqlite_files':ir.files,'filesystem_files':fr.files,'hash_manifest_entries':len(manifest.documents)},'caveats':['Warm OS caches; fresh process does not imply cold cache.','Storage medium is reported only when the OS exposes it; tmpfs or unknown media are not described as SSD.','Filesystem bulk import is durable per file but has no equivalent multi-file rollback.','Every ordinary operation has 30 samples and every bulk ingestion has three samples in every mode.'],'elapsed_seconds':time.perf_counter()-started}
         validate_report(report,count,target); output=Path(output); output.parent.mkdir(parents=True,exist_ok=True); output.write_text(json.dumps(report,indent=2)); return report
     finally: shutil.rmtree(work,ignore_errors=True)
 
@@ -155,8 +183,11 @@ def validate_report(report,expected_count,expected_bytes):
     for key in ('runner_peak_rss_kib','peak_cli_rss_kib','database_bytes','filesystem_bytes','peak_journal_bytes'):
         if resources.get(key) is None or resources[key]<0: raise ValueError(f'missing resource {key}')
     if resources['peak_journal_bytes']==0: raise ValueError('journal was not observed')
-    if not report.get('throughput') or not report.get('encoding_detection'): raise ValueError('missing throughput/detector separation')
-    if not report.get('checks') or not report.get('caveats'): raise ValueError('missing checks/caveats')
+    encoding=report.get('encoding_detection',{})
+    if not report.get('throughput') or 'decoding only' not in encoding.get('method',''): raise ValueError('missing throughput/decoding-only separation')
+    phases=report.get('validation_phases',{})
+    if len(phases.get('fast_open',{}).get('samples_seconds',[])) != 30 or len(phases.get('full_audit',{}).get('samples_seconds',[])) != 3: raise ValueError('missing validation phase measurements')
+    if not env.get('storage') or not report.get('checks') or not report.get('caveats'): raise ValueError('missing checks/caveats/storage')
 
 def main(argv=None):
     import argparse

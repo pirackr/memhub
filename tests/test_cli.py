@@ -29,6 +29,35 @@ def test_ranges_errors_invalid_stdin_and_import(tmp_path):
     assert imported.returncode==0 and json.loads(imported.stdout)['result']['files']==1
 
 
+def test_verify_init_executes_post_creation_audit(tmp_path, monkeypatch):
+    import memhub.cli as cli
+
+    vault = tmp_path / 'v.db'
+    audited = []
+    real_audit = cli.audit_vault
+
+    def recording_audit(path):
+        audited.append(path)
+        return real_audit(path)
+
+    monkeypatch.setattr(cli, 'audit_vault', recording_audit)
+    assert cli.main(['--vault', str(vault), '--verify', 'init']) == 0
+    assert audited == [vault]
+
+
+def test_global_verify_flag_runs_full_audit(tmp_path):
+    vault = tmp_path / 'v.db'; assert run('--vault', vault, 'init').returncode == 0
+    raw = sqlite3.connect(vault); raw.execute('PRAGMA foreign_keys=OFF')
+    raw.execute("INSERT INTO entries(parent_id,name,kind,content,created_at,updated_at) VALUES(1,'gone','directory',NULL,'t','t')")
+    parent = raw.execute("SELECT id FROM entries WHERE name='gone'").fetchone()[0]
+    raw.execute("INSERT INTO entries(parent_id,name,kind,content,created_at,updated_at) VALUES(?,'orphan','file','x','t','t')", (parent,))
+    raw.execute('DELETE FROM entries WHERE id=?', (parent,)); raw.commit(); raw.close()
+    assert run('--vault', vault, '--json', 'ls').returncode == 0
+    verified = run('--vault', vault, '--json', '--verify', 'ls')
+    assert verified.returncode == 7
+    assert json.loads(verified.stderr)['error']['code'] == 'schema_validation_failed'
+
+
 def test_excluded_commands_and_missing_vault(tmp_path):
     for command in ('search','grep','mkdir','stat','find','mv'):
         assert run('--vault',tmp_path/'v',command).returncode==2
