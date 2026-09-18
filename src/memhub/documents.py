@@ -27,6 +27,12 @@ The storage library neither starts nor commits the surrounding transaction in
 :func:`write_in_transaction`; the caller owns those boundaries. In
 :func:`write_file` the :class:`~memhub.Vault` transaction owns them and rolls
 back every created parent when the write raises.
+
+:func:`edit_file` commits exact-text replacements. It runs inside the caller's
+write reservation, resolves the current document, checks ``if_match`` against it,
+splices the result through :func:`memhub.edits.apply_edits`, and persists that
+result through :func:`write_in_transaction` -- never beginning, reserving, or
+committing a second transaction, and never returning before the commit.
 """
 
 from __future__ import annotations
@@ -34,6 +40,7 @@ from __future__ import annotations
 import sqlite3
 from typing import TYPE_CHECKING, Optional, Tuple
 
+from .edits import apply_edits
 from .errors import Conflict, InvalidInput, Missing
 from .models import Entry, ReadResult, WriteResult
 from .paths import normalize_path
@@ -41,12 +48,14 @@ from .text import content_hash, validate_text
 from .tree import DIRECTORY, FILE, ensure_directories, resolve
 
 if TYPE_CHECKING:
+    from .models import Edit
     from .vault import Vault
 
 __all__ = [
     "Entry",
     "ReadResult",
     "WriteResult",
+    "edit_file",
     "read_file",
     "write_file",
     "write_in_transaction",
@@ -222,6 +231,96 @@ def write_file(
             content,
             if_match=if_match,
             if_absent=if_absent,
+        )
+
+
+def _edit_in_transaction(
+    connection: sqlite3.Connection,
+    canonical: str,
+    operations: "list[Edit]",
+    if_match: Optional[str] = None,
+) -> WriteResult:
+    """Resolve the existing document, check its hash, and commit an edit.
+
+    The connection must already be inside a caller-owned write transaction
+    (``BEGIN IMMEDIATE``); this helper never begins, commits, or re-reserves a
+    transaction. It refuses to fabricate a new file, checks ``if_match`` against
+    the *current* stored content, runs the pure replacement plan
+    (:func:`memhub.edits.apply_edits`), and then persists the result through
+    :func:`write_in_transaction`, which overwrites the existing row inside the
+    same transaction.
+
+    A missing path raises :class:`Missing`; a hash that does not match the
+    current content raises :class:`Conflict`; an unmatched, ambiguous, or
+    overlapping replacement raises :class:`Conflict`.
+    """
+    # An edit has no meaning for a document that is not already stored, and must
+    # never create a new file, so resolve first and refuse when it is absent or
+    # a directory before any replacement is planned.
+    try:
+        row = resolve(connection, canonical)
+    except Missing:
+        row = None
+    if row is None or row["kind"] != FILE:
+        raise Missing(
+            "edit_missing_document",
+            "cannot edit a document that does not exist",
+        )
+
+    existing_content = row["content"] if row["content"] is not None else ""
+
+    # Check the hash against the current stored content inside the reservation.
+    if if_match is not None and if_match != content_hash(existing_content):
+        raise Conflict(
+            "stale_hash",
+            "if_match hash does not match the current document content",
+        )
+
+    # The pure replacement plan touches no storage and rejects unmatched,
+    # ambiguous, overlapping, or control-introducing edits up front.
+    new_content = apply_edits(existing_content, operations)
+
+    # Persist through the caller-owned transaction: no nested BEGIN/COMMIT and no
+    # second write reservation. The file already exists here, so
+    # write_in_transaction overwrites its content and preserves its created_at
+    # while advancing only the file's own updated_at.
+    return write_in_transaction(
+        connection,
+        canonical,
+        new_content,
+        if_match=if_match,
+    )
+
+
+def edit_file(
+    vault: "Vault",
+    path: str,
+    operations: "list[Edit]",
+    if_match: Optional[str] = None,
+) -> WriteResult:
+    """Public atomic conditional edit of ``path`` with exact-text replacements.
+
+    ``operations`` is a non-empty sequence of :class:`~memhub.models.Edit` values
+    (typically produced by :func:`memhub.edits.parse_edits`). The path is
+    normalized before any resolution, and the whole edit runs through the vault's
+    writer transaction, which acquires the write reservation (``BEGIN IMMEDIATE``)
+    before the existing-document/hash checks are made and rolls back every created
+    parent if the edit raises. On success it returns a :class:`WriteResult`
+    carrying the new entry and content hash only after the commit.
+
+    The replacement is applied by :func:`memhub.edits.apply_edits`, so every
+    occurrence selection is resolved against the current document and the spliced
+    result must itself be admitted text. A missing path raises
+    :class:`Missing`; a stale ``if_match`` raises :class:`Conflict`; an
+    unmatched, ambiguous, or overlapping edit raises :class:`Conflict`.
+    """
+    canonical = normalize_path(path)
+    with vault.transaction(write=True):
+        return _edit_in_transaction(
+            vault.connection,
+            canonical,
+            operations,
+            if_match=if_match,
         )
 
 

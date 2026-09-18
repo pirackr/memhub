@@ -13,9 +13,13 @@ from __future__ import annotations
 
 import pytest
 
+import memhub
+from memhub.documents import WriteResult, edit_file, read_file, write_file
 from memhub.edits import apply_edits, parse_edits
-from memhub.errors import Conflict, InvalidInput
+from memhub.errors import Conflict, InvalidInput, Missing
 from memhub.models import Edit
+from memhub.text import content_hash
+from memhub.tree import ensure_directories, resolve
 
 
 # --------------------------------------------------------------------------- #
@@ -313,3 +317,113 @@ def test_parse_then_apply_roundtrip():
 def test_parse_then_apply_rejects_ambiguous_operation():
     with pytest.raises(Conflict):
         apply_edits("a-a", parse_edits([{"old_text": "a", "new_text": "b"}]))
+
+
+# --------------------------------------------------------------------------- #
+# edit_file integration (Task 8: conflict-safe conditional edits)
+# --------------------------------------------------------------------------- #
+
+
+def test_edit_file_replaces_text_and_returns_write_result(vault):
+    write_file(vault, "/doc.txt", "hello world")
+    result = edit_file(vault, "/doc.txt", [Edit("world", "there")])
+    assert isinstance(result, WriteResult)
+    assert result.content_hash == content_hash("hello there")
+    assert read_file(vault, "/doc.txt").content == "hello there"
+
+
+def test_edit_file_applies_non_overlapping_multi_edit(vault):
+    write_file(vault, "/doc.txt", "a-b-c")
+    result = edit_file(vault, "/doc.txt", [Edit("a", "A"), Edit("c", "C")])
+    assert result.content_hash == content_hash("A-b-C")
+    assert read_file(vault, "/doc.txt").content == "A-b-C"
+
+
+def test_edit_file_supports_replace_all_within_a_transaction(vault):
+    write_file(vault, "/doc.txt", "a-a-a")
+    result = edit_file(vault, "/doc.txt", [Edit("a", "b", replace_all=True)])
+    assert result.content_hash == content_hash("b-b-b")
+    assert read_file(vault, "/doc.txt").content == "b-b-b"
+
+
+def test_edit_file_allows_result_equal_to_original(vault):
+    write_file(vault, "/doc.txt", "unchanged")
+    result = edit_file(vault, "/doc.txt", [Edit("unchanged", "unchanged")])
+    assert result.content_hash == content_hash("unchanged")
+    assert read_file(vault, "/doc.txt").content == "unchanged"
+
+
+def test_edit_file_requires_an_existing_document(vault):
+    with pytest.raises(Missing) as missing:
+        edit_file(vault, "/missing.txt", [Edit("a", "b")])
+    assert missing.value.code == "edit_missing_document"
+
+
+def test_edit_file_rejects_editing_a_directory(vault):
+    # Create the directory inside a caller-owned write transaction so the edit
+    # under test sees a real directory entry to refuse, rather than resolving a
+    # nonexistent path (which would raise Missing from resolve itself).
+    with vault.transaction(write=True):
+        ensure_directories(vault.connection, "/folder")
+    with pytest.raises(Missing) as missing:
+        edit_file(vault, "/folder", [Edit("a", "b")])
+    assert missing.value.code == "edit_missing_document"
+
+
+def test_edit_file_rejects_stale_if_match(vault):
+    write_file(vault, "/doc.txt", "hello")
+    with pytest.raises(Conflict) as conflict:
+        edit_file(vault, "/doc.txt", [Edit("hello", "hi")], if_match="deadbeef")
+    assert conflict.value.code == "stale_hash"
+
+
+def test_edit_file_accepts_a_matching_if_match(vault):
+    write_file(vault, "/doc.txt", "hello")
+    digest = content_hash("hello")
+    result = edit_file(vault, "/doc.txt", [Edit("hello", "hi")], if_match=digest)
+    assert result.content_hash == content_hash("hi")
+
+
+def test_edit_file_rejects_overlapping_operations(vault):
+    write_file(vault, "/doc.txt", "abc")
+    # "ab" selects [0, 2) and "bc" selects [1, 3); the two selections intersect,
+    # so the edit must be rejected as an overlap rather than applied.
+    with pytest.raises(Conflict) as conflict:
+        edit_file(vault, "/doc.txt", [Edit("ab", "1"), Edit("bc", "2")])
+    assert conflict.value.code == "edit_ranges_overlap"
+
+
+def test_edit_file_stale_hash_leaves_content_and_timestamp_unchanged(vault):
+    write_file(vault, "/doc.txt", "original")
+    before = resolve(vault.connection, "/doc.txt")
+    with pytest.raises(Conflict):
+        edit_file(vault, "/doc.txt", [Edit("original", "changed")], if_match="wrong")
+    after = resolve(vault.connection, "/doc.txt")
+    assert after["content"] == "original"
+    assert after["updated_at"] == before["updated_at"]
+    # The failed edit rolled back inside its write reservation; the document is
+    # still exactly what it was and the vault remains intact.
+    assert read_file(vault, "/doc.txt").content == "original"
+    assert vault.connection.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+
+
+def test_edit_file_preserves_created_at_and_advances_only_file_timestamp(vault):
+    write_file(vault, "/doc.txt", "first")
+    original = resolve(vault.connection, "/doc.txt")
+    edit_file(vault, "/doc.txt", [Edit("first", "second")])
+    updated = resolve(vault.connection, "/doc.txt")
+    assert updated["created_at"] == original["created_at"]
+    assert updated["content"] == "second"
+
+
+def test_edit_file_parses_json_operations_before_commit(vault):
+    write_file(vault, "/doc.txt", "hello world")
+    operations = parse_edits(
+        [
+            {"old_text": "lo", "new_text": "lOR", "replace_all": False},
+            {"old_text": "world", "new_text": "WORLD", "replace_all": True},
+        ]
+    )
+    result = edit_file(vault, "/doc.txt", operations)
+    assert result.content_hash == content_hash("hellOR WORLD")
+    assert read_file(vault, "/doc.txt").content == "hellOR WORLD"

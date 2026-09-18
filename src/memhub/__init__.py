@@ -21,11 +21,12 @@ from .documents import (
     Entry,
     ReadResult,
     WriteResult,
+    edit_file,
     read_file,
     write_file,
     write_in_transaction,
 )
-from .models import ListResult
+from .models import Edit, ListResult
 from .tree import list_entries
 from .vault import Vault, create_vault, open_vault
 
@@ -37,8 +38,10 @@ __all__ = [
     "ReadResult",
     "WriteResult",
     "ListResult",
+    "Edit",
     "write_file",
     "write_in_transaction",
+    "edit_file",
     "read_file",
     "list_entries",
     "MemhubError",
