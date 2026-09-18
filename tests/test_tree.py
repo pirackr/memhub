@@ -631,3 +631,220 @@ def test_recursive_listing_uses_sibling_index_for_child_lookup(vault):
     ).fetchall()
     detail = " ".join(str(step["detail"]) for step in plan)
     assert "INDEX" in detail
+
+
+# ---------------------------------------------------------------------------
+# remove_entry: guarded subtree removal.
+# ---------------------------------------------------------------------------
+
+# Fixed stamp used to build deterministic fixtures whose metadata we assert on.
+_TS = "2020-01-01T00:00:00+00:00"
+
+
+def _canonical_parent_and_name(canonical: str) -> Tuple[str, str]:
+    """Split a canonical path into (parent canonical, leaf name).
+
+    Mirrors :func:`memhub.documents._parent_and_name` so tests can insert rows
+    directly with controlled timestamps.
+    """
+    stripped = canonical[1:]
+    name = stripped.rsplit("/", 1)[-1]
+    parent_part = stripped.rsplit("/", 1)[0] if "/" in stripped else ""
+    parent = "/" + parent_part if parent_part else "/"
+    return parent, name
+
+
+def _insert_dir(vault, canonical, stamp: str = _TS):
+    """Insert a single directory row directly, resolving its parent.
+
+    The parent must already exist in the current transaction (or a committed
+    one) so the foreign key holds. The vault's transaction is *not* committed by
+    this helper.
+    """
+    parent, name = _canonical_parent_and_name(canonical)
+    parent_id = resolve(vault.connection, parent)["id"]
+    vault.connection.execute(
+        "INSERT INTO entries "
+        "(parent_id, name, kind, content, created_at, updated_at) "
+        "VALUES (?, ?, 'directory', NULL, ?, ?)",
+        (parent_id, name, stamp, stamp),
+    )
+
+
+def _insert_file(vault, canonical, content, stamp: str = _TS):
+    """Insert a single file row directly, resolving its parent."""
+    parent, name = _canonical_parent_and_name(canonical)
+    parent_id = resolve(vault.connection, parent)["id"]
+    vault.connection.execute(
+        "INSERT INTO entries "
+        "(parent_id, name, kind, content, created_at, updated_at) "
+        "VALUES (?, ?, 'file', ?, ?, ?)",
+        (parent_id, name, content, stamp, stamp),
+    )
+
+
+def _count(vault):
+    return vault.connection.execute("SELECT COUNT(*) FROM entries").fetchone()[0]
+
+
+def test_remove_file_deletes_it_and_updates_direct_parent(vault):
+    with vault.transaction(write=True):
+        _insert_dir(vault, "/parent")
+        _insert_file(vault, "/parent/child", "hi")
+        vault.connection.commit()
+    parent_before = vault.connection.execute(
+        "SELECT updated_at FROM entries WHERE name = 'parent'"
+    ).fetchone()[0]
+    assert parent_before == _TS
+
+    memhub.remove_entry(vault, "/parent/child")
+
+    with pytest.raises(Missing):
+        resolve(vault.connection, "/parent/child")
+    # The direct parent's membership changed, so only its updated_at advances.
+    parent_after = vault.connection.execute(
+        "SELECT updated_at FROM entries WHERE name = 'parent'"
+    ).fetchone()[0]
+    assert parent_after != _TS
+    assert parent_after.endswith("+00:00")
+    # Root + the surviving /parent directory remain; the file is gone.
+    assert _count(vault) == 2
+    assert vault.connection.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+
+
+def test_remove_empty_directory(vault):
+    with vault.transaction(write=True):
+        _insert_dir(vault, "/empty")
+        vault.connection.commit()
+    memhub.remove_entry(vault, "/empty")
+    with pytest.raises(Missing):
+        resolve(vault.connection, "/empty")
+    # Only the root survives.
+    assert _count(vault) == 1
+
+
+def test_remove_nonempty_directory_requires_recursive(vault):
+    with vault.transaction(write=True):
+        _insert_dir(vault, "/leaf")
+        _insert_file(vault, "/leaf/note", "x")
+        vault.connection.commit()
+    with pytest.raises(Conflict) as exc:
+        memhub.remove_entry(vault, "/leaf")
+    assert exc.value.code == "directory_not_empty"
+    # Nothing was removed by the refused call.
+    assert resolve(vault.connection, "/leaf")["name"] == "leaf"
+    assert resolve(vault.connection, "/leaf/note")["name"] == "note"
+    assert _count(vault) == 3  # root + /leaf + /leaf/note
+
+
+def test_remove_protected_root_raises_conflict(vault):
+    with pytest.raises(Conflict) as exc:
+        memhub.remove_entry(vault, "/")
+    assert exc.value.code == "root_protected"
+    assert resolve(vault.connection, "/")["id"] == 1
+    assert _count(vault) == 1
+
+
+def test_remove_recursive_keeps_siblings_and_ancestor_timestamps(vault):
+    # Build the whole /keep subtree in one write reservation; the direct-insert
+    # helper would refuse because its parent does not yet exist.
+    with vault.transaction(write=True):
+        ensure_directories(vault.connection, "/keep/a/b")
+        vault.connection.commit()
+    with vault.transaction(write=True):
+        _insert_dir(vault, "/other")
+        _insert_dir(vault, "/other/child")
+        vault.connection.commit()
+
+    other_before = vault.connection.execute(
+        "SELECT updated_at FROM entries WHERE name = 'other'"
+    ).fetchone()[0]
+
+    memhub.remove_entry(vault, "/keep", recursive=True)
+
+    # The removed subtree is gone.
+    for gone in ("/keep", "/keep/a", "/keep/a/b"):
+        with pytest.raises(Missing):
+            resolve(vault.connection, gone)
+    # The sibling subtree is untouched, including its (unaffected) timestamp.
+    other_after = vault.connection.execute(
+        "SELECT updated_at FROM entries WHERE name = 'other'"
+    ).fetchone()[0]
+    assert other_after == other_before
+    assert resolve(vault.connection, "/other/child")["name"] == "child"
+    # Only root + /other + /other/child remain; the whole /keep subtree is gone.
+    assert _count(vault) == 3
+    assert vault.connection.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+
+
+def test_remove_recursive_handles_deep_tree_beyond_python_recursion(vault):
+    levels = 1200
+    deep = "/" + "/".join(f"n{i}" for i in range(levels))
+    with vault.transaction(write=True):
+        ensure_directories(vault.connection, deep)
+    vault.connection.commit()
+
+    # 1200 levels exceeds the default Python recursion limit and would break any
+    # implementation that recurses in Python or depends on a trigger's cascade
+    # depth; the SQL CTE handles it without either.
+    memhub.remove_entry(vault, "/n0", recursive=True)
+    with vault.transaction(write=False):
+        with pytest.raises(Missing):
+            resolve(vault.connection, "/n0")
+        with pytest.raises(Missing):
+            resolve(vault.connection, deep)
+    assert _count(vault) == 1  # only the root survives
+    assert vault.connection.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+
+
+def test_partial_deletion_rolls_back_and_preserves_ancestor(vault):
+    # Deterministic subtree: keep(2) -> a(3) -> b(4) -> c(5) -> d(6).
+    with vault.transaction(write=True):
+        _insert_dir(vault, "/keep")
+        _insert_dir(vault, "/keep/a")
+        _insert_dir(vault, "/keep/a/b")
+        _insert_dir(vault, "/keep/a/b/c")
+        _insert_dir(vault, "/keep/a/b/c/d")
+        vault.connection.commit()
+    # A sibling tree that must survive completely.
+    with vault.transaction(write=True):
+        _insert_dir(vault, "/other")
+        _insert_dir(vault, "/other/child")
+        vault.connection.commit()
+
+    root_before = vault.connection.execute(
+        "SELECT updated_at FROM entries WHERE parent_id IS NULL"
+    ).fetchone()[0]
+
+    # Inject a failure that fires on the second delete (c, id 5) so the
+    # bottom-up sweep is interrupted partway through.
+    vault.connection.execute(
+        "CREATE TRIGGER injected_delete_fail "
+        "BEFORE DELETE ON entries FOR EACH ROW WHEN OLD.id = 5 "
+        "BEGIN SELECT RAISE(ABORT, 'injected failure during deletion'); END;"
+    )
+    vault.connection.commit()
+
+    # remove_entry owns the writer transaction, so the injected failure rolls the
+    # whole removal back and surfaces as a typed MemhubError.
+    with pytest.raises(memhub.MemhubError):
+        memhub.remove_entry(vault, "/keep", recursive=True)
+
+    # The rollback restored everything: the subtree and the sibling are intact.
+    for present in (
+        "/keep", "/keep/a", "/keep/a/b", "/keep/a/b/c", "/keep/a/b/c/d",
+        "/other", "/other/child",
+    ):
+        assert resolve(vault.connection, present) is not None
+    # The surviving ancestor's timestamp was never committed.
+    root_after = vault.connection.execute(
+        "SELECT updated_at FROM entries WHERE parent_id IS NULL"
+    ).fetchone()[0]
+    assert root_after == root_before
+    assert vault.connection.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+
+    # Drop the injected trigger so the disposable vault is left clean.
+    with vault.transaction(write=True):
+        vault.connection.execute("DROP TRIGGER injected_delete_fail")
+    vault.connection.commit()
+

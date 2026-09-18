@@ -27,7 +27,7 @@ from .documents import (
     write_in_transaction,
 )
 from .models import Edit, ListResult
-from .tree import list_entries
+from .tree import list_entries, remove_entry
 from .vault import Vault, create_vault, open_vault
 
 __all__ = [
@@ -44,6 +44,7 @@ __all__ = [
     "edit_file",
     "read_file",
     "list_entries",
+    "remove_entry",
     "MemhubError",
     "InvalidInput",
     "Missing",

@@ -26,7 +26,7 @@ from .errors import Conflict, InvalidInput, Missing
 from .models import Entry, ListResult
 from .paths import normalize_path
 
-__all__ = ["resolve", "ensure_directories", "list_entries"]
+__all__ = ["resolve", "ensure_directories", "list_entries", "remove_entry"]
 
 # Entry kinds. Files store document content; directories never do.
 FILE = "file"
@@ -300,6 +300,109 @@ def ensure_directories(connection: sqlite3.Connection, path: str) -> sqlite3.Row
         "SELECT * FROM entries WHERE id = ?",
         (last_id,),
     ).fetchone()
+
+
+def _descendant_ids_bottom_up(
+    connection: sqlite3.Connection, target_id: int
+) -> list[int]:
+    """Return ``target_id`` and every descendant, deepest row first.
+
+    The whole subtree is gathered with a single recursive CTE, so no Python
+    recursion is involved and neither the depth of the tree nor any cascade
+    trigger's execution depth can be exhausted. Rows are ordered by ``depth``
+    descending (ties by ``id``) so a parent is always deleted *after* its
+    children. With foreign keys enabled that bottom-up order is exactly what
+    makes each ``DELETE`` succeed on its own: a parent row only disappears once
+    every row that points at it has already gone.
+    """
+    return [
+        row[0]
+        for row in connection.execute(
+            "WITH RECURSIVE subtree(id, depth) AS ("
+            "  SELECT id, 0 FROM entries WHERE id = ?"
+            "  UNION ALL "
+            "  SELECT e.id, sp.depth + 1 "
+            "  FROM entries e JOIN subtree sp ON e.parent_id = sp.id"
+            ") SELECT id FROM subtree ORDER BY depth DESC, id DESC",
+            (target_id,),
+        ).fetchall()
+    ]
+
+
+def _remove_in_transaction(
+    connection: sqlite3.Connection, canonical: str, recursive: bool
+) -> None:
+    """Delete ``canonical`` (and, when requested, its subtree) in a write txn.
+
+    The connection must already be inside a caller-owned write transaction; this
+    helper never begins or commits one. The target is resolved first, so a
+    missing path raises :class:`Missing` before anything is touched. The root is
+    rejected explicitly with :class:`Conflict` (the schema trigger is the
+    backstop for raw callers that bypass this helper). A non-empty directory is
+    refused unless ``recursive`` is true -- this is the recursive guard.
+    When recursive removal is allowed, descendants are collected with SQL and
+    deleted bottom-up (see :func:`_descendant_ids_bottom_up`), so the foreign
+    key chain never breaks and Python recursion depth is irrelevant.
+
+    The single surviving direct parent is updated in the same transaction; its
+    own ancestors are left untouched, matching the "directly affected directory
+    only" timestamp rule.
+    """
+    row = resolve(connection, canonical)
+
+    if row["parent_id"] is None:
+        raise Conflict(
+            "root_protected",
+            "the root entry cannot be removed",
+        )
+
+    if row["kind"] == DIRECTORY:
+        has_child = (
+            connection.execute(
+                "SELECT 1 FROM entries WHERE parent_id = ? LIMIT 1",
+                (row["id"],),
+            ).fetchone() is not None
+        )
+        if has_child and not recursive:
+            raise Conflict(
+                "directory_not_empty",
+                f"path {canonical!r} is a non-empty directory; "
+                "pass recursive=True to remove it and its subtree",
+            )
+
+    # ``_descendant_ids_bottom_up`` always includes the target itself (depth 0)
+    # plus, when recursive, every reachable child; a file or empty directory
+    # simply yields its own row. Deleting bottom-up keeps the FK chain valid.
+    for target_id in _descendant_ids_bottom_up(connection, row["id"]):
+        connection.execute(
+            "DELETE FROM entries WHERE id = ?", (target_id,)
+        )
+
+    # Deletion changes the removed node's direct-parent membership, so only that
+    # directory's updated_at advances; ancestors above it are not rewritten.
+    connection.execute(
+        "UPDATE entries SET updated_at = ? WHERE id = ?",
+        (_utcnow_iso(), row["parent_id"]),
+    )
+
+
+def remove_entry(vault: "Vault", path: str, recursive: bool = False) -> None:
+    """Remove a file or an empty directory, or an entire subtree when recursive.
+
+    ``path`` is normalized before any resolution. The whole removal runs through
+    the vault's writer transaction, so a missing path raises :class:`Missing`,
+    an unauthorized non-empty-directory removal raises
+    :class:`~memhub.errors.Conflict` (``directory_not_empty``), and root deletion
+    raises :class:`~memhub.errors.Conflict` (``root_protected``). With
+    ``recursive=True`` the target's descendants are collected with SQL and
+    deleted bottom-up in the same transaction, and the surviving direct parent is
+    updated too. A failure partway through -- injected or otherwise -- rolls the
+    entire removal back, leaving surviving siblings and ancestor timestamps
+    unchanged, and this function only reports success after the commit.
+    """
+    canonical = normalize_path(path)
+    with vault.transaction(write=True):
+        _remove_in_transaction(vault.connection, canonical, recursive)
 
 
 def _utcnow_iso() -> str:
