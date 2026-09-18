@@ -1,0 +1,9 @@
+{
+  "report_version": 1,
+  "generated_at": "2026-09-18",
+  "trials": [
+    {"harness":"Claude Code","harness_version":null,"model":null,"scenario":"all fixed scenarios","status":"untested","reason":"No executable/credentials explicitly available; live trials were opt-in.","tool_calls":null,"mistakes":null,"completion":null,"latency_seconds":null},
+    {"harness":"OpenCode","harness_version":null,"model":null,"scenario":"all fixed scenarios","status":"untested","reason":"No executable/credentials explicitly available; live trials were opt-in.","tool_calls":null,"mistakes":null,"completion":null,"latency_seconds":null},
+    {"harness":"pi","harness_version":null,"model":"openai-codex/gpt-5.6-sol","scenario":"all fixed scenarios","status":"untested","reason":"Installed harness is the active implementation worker; spawning agent trials is prohibited by the assignment.","tool_calls":null,"mistakes":null,"completion":null,"latency_seconds":null}
+  ]
+}

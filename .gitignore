@@ -20,11 +20,9 @@ env/
 *.db-wal
 *.db-shm
 
-# --- Generated benchmark corpora and reports ---
+# --- Generated benchmark corpora (JSON evidence remains trackable) ---
 /memhub_vaults/
 benchmarks/corpus/
-benchmarks/results/*.json
-!benchmarks/results/.gitkeep
 
 # --- Local scratch ---
 _probe.py
