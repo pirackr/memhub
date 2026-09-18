@@ -19,7 +19,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Optional
 
-__all__ = ["Entry", "WriteResult", "ReadResult", "ListResult", "Edit", "DecodedText"]
+__all__ = ["Entry", "WriteResult", "ReadResult", "ListResult", "Edit", "DecodedText", "SourceItem", "ImportWarning", "ImportResult"]
 
 
 @dataclass(frozen=True)
@@ -106,6 +106,31 @@ class Edit:
     old_text: str
     new_text: str
     replace_all: bool = False
+
+
+@dataclass(frozen=True)
+class SourceItem:
+    """One safely opened host source item."""
+
+    source_path: str
+    relative_path: str
+    kind: str
+    data: Optional[bytes] = None
+
+
+@dataclass(frozen=True)
+class ImportWarning:
+    source_path: str
+    encoding: str
+    message: str
+    confidence: float
+
+
+@dataclass(frozen=True)
+class ImportResult:
+    files: int
+    directories: int
+    encoding_counts: dict[str, int]
 
 
 @dataclass(frozen=True)

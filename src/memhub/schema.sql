@@ -15,7 +15,13 @@ CREATE TABLE entries (
     content    TEXT,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
-    FOREIGN KEY (parent_id) REFERENCES entries (id)
+    FOREIGN KEY (parent_id) REFERENCES entries (id),
+    CHECK (kind IN ('file', 'directory')),
+    CHECK ((kind = 'file' AND content IS NOT NULL) OR (kind = 'directory' AND content IS NULL)),
+    CHECK ((parent_id IS NULL AND name = '' AND kind = 'directory' AND content IS NULL)
+        OR (parent_id IS NOT NULL AND name <> ''
+            AND instr(name, '/') = 0
+            AND name NOT GLOB '*[' || char(0) || '-' || char(31) || char(127) || ']*'))
 );
 
 -- Sibling uniqueness: a directory owns at most one child with any given name.
@@ -65,9 +71,10 @@ CREATE TRIGGER entries_kind_check
 CREATE TRIGGER entries_content_kind
     BEFORE INSERT ON entries
     FOR EACH ROW
-    WHEN NEW.content IS NOT NULL AND NEW.kind <> 'file'
+    WHEN (NEW.kind = 'file' AND NEW.content IS NULL)
+        OR (NEW.kind = 'directory' AND NEW.content IS NOT NULL)
     BEGIN
-        SELECT RAISE(ABORT, 'content requires a file kind');
+        SELECT RAISE(ABORT, 'file content is required and directory content must be null');
     END;
 
 -- Non-root entries must carry a usable name. The root keeps an empty name by
@@ -75,9 +82,12 @@ CREATE TRIGGER entries_content_kind
 CREATE TRIGGER entries_name_check
     BEFORE INSERT ON entries
     FOR EACH ROW
-    WHEN NEW.parent_id IS NOT NULL AND (NEW.name IS NULL OR NEW.name = '')
+    WHEN NEW.parent_id IS NOT NULL AND (
+        NEW.name IS NULL OR NEW.name = '' OR instr(NEW.name, '/') > 0
+        OR NEW.name GLOB '*[' || char(0) || '-' || char(31) || char(127) || ']*'
+    )
     BEGIN
-        SELECT RAISE(ABORT, 'entry name may not be empty');
+        SELECT RAISE(ABORT, 'invalid entry name');
     END;
 
 -- An entry cannot reference itself as its parent.
@@ -103,6 +113,16 @@ CREATE TRIGGER entries_identity_protect
         OR NEW.created_at <> OLD.created_at
     BEGIN
         SELECT RAISE(ABORT, 'entry identity is immutable');
+    END;
+
+-- Content rules also apply to raw UPDATE statements.
+CREATE TRIGGER entries_content_update
+    BEFORE UPDATE OF content ON entries
+    FOR EACH ROW
+    WHEN (NEW.kind = 'file' AND NEW.content IS NULL)
+        OR (NEW.kind = 'directory' AND NEW.content IS NOT NULL)
+    BEGIN
+        SELECT RAISE(ABORT, 'file content is required and directory content must be null');
     END;
 
 -- The root can never be deleted; every other entry's deletion is left to the

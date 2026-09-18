@@ -20,8 +20,11 @@ Design contract (see spec section 3-4):
 from __future__ import annotations
 
 import importlib.resources as _resources
+import os
 import sqlite3
+import tempfile
 from contextlib import contextmanager
+from functools import lru_cache
 from pathlib import Path
 from typing import Iterator, Union
 
@@ -79,8 +82,17 @@ def _safe_rollback(conn: sqlite3.Connection) -> None:
         pass
 
 
-def _safe_unlink(host: Path) -> None:
+def _safe_unlink(host: Path, identity: tuple[int, int] | None = None) -> None:
+    """Unlink only the staging inode created by this process.
+
+    The identity guard prevents cleanup from deleting a path that a hostile or
+    concurrent directory writer replaced after staging was created.
+    """
     try:
+        if identity is not None:
+            current = host.lstat()
+            if (current.st_dev, current.st_ino) != identity:
+                return
         host.unlink()
     except OSError:
         pass
@@ -118,6 +130,20 @@ def _is_sqlite_file(host: Path) -> bool:
         return False
 
 
+@lru_cache(maxsize=1)
+def _canonical_schema_objects() -> dict[tuple[str, str], str]:
+    """Return SQLite's canonicalized SQL for every required schema object."""
+    reference = sqlite3.connect(':memory:')
+    try:
+        reference.executescript(_load_schema_text())
+        return {(row[0], row[1]): row[2] for row in reference.execute(
+            "SELECT type, name, sql FROM sqlite_master "
+            "WHERE name NOT LIKE 'sqlite_%' AND type IN ('table','index','trigger')"
+        )}
+    finally:
+        reference.close()
+
+
 def _assert_memhub_vault(conn: sqlite3.Connection) -> None:
     app_id = conn.execute("PRAGMA application_id").fetchone()[0]
     if app_id != MEMHUB_APP_ID:
@@ -131,17 +157,35 @@ def _assert_memhub_vault(conn: sqlite3.Connection) -> None:
             "unsupported_vault_version",
             f"unsupported vault schema version {version} (expected {VAULT_SCHEMA_VERSION})",
         )
-    tables = {
-        row[0]
-        for row in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
-    }
-    if "entries" not in tables:
-        raise VaultFailure("schema_validation_failed", "required table 'entries' is missing")
-    root_count = conn.execute(
-        "SELECT COUNT(*) FROM entries WHERE parent_id IS NULL"
-    ).fetchone()[0]
-    if root_count == 0:
-        raise VaultFailure("schema_validation_failed", "vault has no root entry")
+    objects = {(row[0], row[1]): row[2] for row in conn.execute(
+        "SELECT type, name, sql FROM sqlite_master "
+        "WHERE name NOT LIKE 'sqlite_%' AND type IN ('table','index','trigger')"
+    )}
+    canonical = _canonical_schema_objects()
+    if any(objects.get(identity) != sql for identity, sql in canonical.items()):
+        raise VaultFailure(
+            "schema_validation_failed",
+            "required schema objects are missing or differ from canonical definitions",
+        )
+    columns = [(r[1], r[2], r[3], r[5]) for r in conn.execute("PRAGMA table_info(entries)")]
+    expected = [('id', 'INTEGER', 0, 1), ('parent_id', 'INTEGER', 0, 0),
+                ('name', 'TEXT', 1, 0), ('kind', 'TEXT', 1, 0),
+                ('content', 'TEXT', 0, 0), ('created_at', 'TEXT', 1, 0),
+                ('updated_at', 'TEXT', 1, 0)]
+    if columns != expected:
+        raise VaultFailure("schema_validation_failed", "entries columns do not match schema")
+    integrity = conn.execute("PRAGMA integrity_check").fetchone()[0]
+    foreign = conn.execute("PRAGMA foreign_key_check").fetchone()
+    invalid = conn.execute("""SELECT COUNT(*) FROM entries WHERE
+        kind NOT IN ('file','directory') OR
+        (kind='file' AND content IS NULL) OR (kind='directory' AND content IS NOT NULL) OR
+        (parent_id IS NULL AND NOT(name='' AND kind='directory' AND content IS NULL)) OR
+        (parent_id IS NOT NULL AND (name='' OR instr(name,'/')>0)) OR
+        (parent_id IS NOT NULL AND NOT EXISTS
+          (SELECT 1 FROM entries p WHERE p.id=entries.parent_id AND p.kind='directory'))""").fetchone()[0]
+    roots = conn.execute("SELECT COUNT(*) FROM entries WHERE parent_id IS NULL").fetchone()[0]
+    if integrity != 'ok' or foreign is not None or invalid or roots != 1:
+        raise VaultFailure("schema_validation_failed", "vault integrity or tree invariants failed")
 
 
 def create_vault(path: PathLike) -> None:
@@ -159,15 +203,19 @@ def create_vault(path: PathLike) -> None:
             "host_parent_missing",
             f"host parent directory does not exist: {parent}",
         )
-    if host.exists():
-        raise Conflict(
-            "vault_exists",
-            f"a file already exists at {host}; create_vault never overwrites",
-        )
-
     conn: sqlite3.Connection | None = None
+    temp: Path | None = None
+    staging_identity: tuple[int, int] | None = None
+    fd: int | None = None
     try:
-        conn = sqlite3.connect(str(host))
+        # Keep mkstemp's mode-0600 pathname and descriptor alive throughout
+        # construction.  Never create SQLite at a name that was briefly freed.
+        fd, temp_name = tempfile.mkstemp(prefix=f'.{host.name}.', suffix='.tmp', dir=parent)
+        os.fchmod(fd, 0o600)
+        stat = os.fstat(fd)
+        staging_identity = (stat.st_dev, stat.st_ino)
+        temp = Path(temp_name)
+        conn = sqlite3.connect(str(temp))
         conn.row_factory = sqlite3.Row
         _apply_connection_pragmas(conn)
         # application_id must be set before any schema object exists.
@@ -181,11 +229,34 @@ def create_vault(path: PathLike) -> None:
             (stamp, stamp),
         )
         conn.commit()
+        conn.close()
+        conn = None
+        current = temp.lstat()
+        if (current.st_dev, current.st_ino) != staging_identity:
+            raise VaultFailure('staging_replaced', 'secure vault staging file was replaced')
+        try:
+            os.link(temp, host)
+        except FileExistsError as conflict:
+            raise Conflict("vault_exists", f"a file already exists at {host}; create_vault never overwrites") from conflict
+        _safe_unlink(temp, staging_identity)
+        temp = None
+        os.close(fd)
+        fd = None
+        directory = os.open(parent, os.O_RDONLY | getattr(os, 'O_DIRECTORY', 0))
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
     except BaseException as exc:
         if conn is not None:
             _safe_close(conn)
-        # Cleanup is intentionally restricted to the file this created.
-        _safe_unlink(host)
+        if temp is not None:
+            _safe_unlink(temp, staging_identity)
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
         if isinstance(exc, MemhubError):
             raise
         if isinstance(exc, sqlite3.Error):
@@ -202,14 +273,12 @@ def open_vault(path: PathLike) -> "Vault":
     objects are checked before the connection is returned.
     """
     host = _coerce_path(path)
-    if not host.exists():
-        raise Missing("vault_missing", f"no vault exists at {host}")
-    if not _is_sqlite_file(host):
-        raise VaultFailure("not_a_memhub_vault", f"{host} is not a SQLite database")
-
     conn: sqlite3.Connection | None = None
     try:
-        conn = sqlite3.connect(str(host))
+        # URI mode=rw is the non-creating guarantee; all validation is against
+        # this connected inode rather than a racy preflight pathname read.
+        uri = host.absolute().as_uri() + '?mode=rw'
+        conn = sqlite3.connect(uri, uri=True)
         conn.row_factory = sqlite3.Row
         _apply_connection_pragmas(conn)
         _assert_memhub_vault(conn)
@@ -218,6 +287,8 @@ def open_vault(path: PathLike) -> "Vault":
             _safe_close(conn)
         if isinstance(exc, MemhubError):
             raise
+        if isinstance(exc, sqlite3.OperationalError) and 'unable to open database file' in str(exc).lower():
+            raise Missing("vault_missing", f"no vault exists or is accessible at {host}") from exc
         if isinstance(exc, sqlite3.Error):
             raise _translate_connection_error(exc) from exc
         raise
@@ -282,6 +353,7 @@ class Vault:
                 try:
                     conn.commit()
                 except sqlite3.OperationalError as locked:
+                    _safe_rollback(conn)
                     if _is_lock_error(locked):
                         raise Busy(
                             "database_busy",
@@ -291,6 +363,7 @@ class Vault:
                         "database_error", f"database commit failed: {locked}"
                     ) from locked
                 except sqlite3.Error as other:
+                    _safe_rollback(conn)
                     raise VaultFailure(
                         "database_error", f"database commit failed: {other}"
                     ) from other

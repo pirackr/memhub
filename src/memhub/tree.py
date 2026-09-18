@@ -136,7 +136,7 @@ def _materialize(
     entries: list[Entry] = []
     for row in rows[:limit]:
         if recursive:
-            entry_path = row["vpath"]
+            entry_path = row["vpath"] if parent_canonical == "/" else parent_canonical + row["vpath"]
         elif parent_canonical == "/":
             entry_path = "/" + row["name"]
         else:

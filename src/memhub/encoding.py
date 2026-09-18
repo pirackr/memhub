@@ -95,18 +95,31 @@ def decode_bytes(data: bytes) -> DecodedText:
                 "decode_failed",
                 f"strict decode as {codec!r} failed: {exc}",
             ) from exc
-        return _finish(text, codec, 1.0)
+        # A recognized BOM is a consumed signature, so its leading U+FEFF is
+        # always stripped here.
+        return _finish(text, codec, 1.0, consume_bom=True)
 
+    # Strict UTF-8. Consume the encoding's signature BOM only when the raw
+    # bytes actually begin with the UTF-8 BOM (EF BB BF); a later or non-BOM
+    # U+FEFF that decodes out of ordinary UTF-8 text must be preserved.
+    utf8_bom = data.startswith(b"\xef\xbb\xbf")
     try:
         text = data.decode("utf-8")
     except UnicodeDecodeError:
         text, codec, confidence = _decode_with_detector(data)
-        return _finish(text, codec, confidence)
-    return _finish(text, "utf-8", 1.0)
+        # The detector path consumes no signature: any leading U+FEFF is
+        # genuine content and is preserved.
+        return _finish(text, codec, confidence, consume_bom=False)
+    return _finish(text, "utf-8", 1.0, consume_bom=utf8_bom)
 
 
-def _finish(text: str, encoding: str, confidence: float) -> DecodedText:
-    """Strip a consumed signature BOM, admit the text, and return the record.
+def _finish(text: str, encoding: str, confidence: float, consume_bom: bool) -> DecodedText:
+    """Admit ``text``, optionally strip a consumed signature BOM, and return it.
+
+    ``consume_bom`` selects whether a single leading U+FEFF is stripped as a
+    consumed encoding signature. Per the spec, only a recognized BOM signature
+    (a UTF-16/UTF-32 BOM, or a UTF-8 BOM seen in the raw bytes) is consumed;
+    a genuine U+FEFF that decodes out of ordinary text is always preserved.
 
     Text admission runs through the shared :func:`~memhub.text.validate_text`.
     At this import boundary an admission failure means the *source is
@@ -114,7 +127,7 @@ def _finish(text: str, encoding: str, confidence: float) -> DecodedText:
     2) is translated to :class:`~memhub.errors.Unsupported` (exit status 5)
     rather than escaping across the import boundary.
     """
-    if text.startswith(_BOM_CHAR):
+    if consume_bom and text.startswith(_BOM_CHAR):
         text = text[1:]
     try:
         validate_text(text)
@@ -152,6 +165,8 @@ def _decode_with_detector(data: bytes) -> tuple[str, str, float]:
             "could not identify an encoding for the source text",
         )
 
+    confidence_value = _as_confidence(confidence)
+
     codec = _canonicalize_codec(label)
     if codec is None:
         raise Unsupported(
@@ -167,7 +182,26 @@ def _decode_with_detector(data: bytes) -> tuple[str, str, float]:
             f"strict decode as {codec!r} failed: {exc}",
         ) from exc
 
-    return text, codec, float(confidence) if confidence is not None else 0.0
+    return text, codec, confidence_value
+
+
+def _as_confidence(confidence: object) -> float:
+    """Return ``confidence`` as a float, or refuse a nonnumeric value.
+
+    A detector that returns something that is not a finite-ish number cannot be
+    reported honestly, so map it to :class:`~memhub.errors.Unsupported` here
+    rather than letting a ``float()`` coercion raise elsewhere. A missing
+    (``None``) confidence is not garbage; it stays an honest zero.
+    """
+    if confidence is None:
+        return 0.0
+    try:
+        return float(confidence)
+    except (TypeError, ValueError) as exc:
+        raise Unsupported(
+            "bad_confidence",
+            f"detector confidence {confidence!r} is not numeric",
+        ) from None
 
 
 def _canonicalize_codec(label: object) -> Optional[str]:

@@ -241,6 +241,75 @@ def test_busy_timeout_classifies_lock_as_busy(host_dir):
         second.close()
 
 
+def test_create_race_never_overwrites_or_unlinks_winner(host_dir, monkeypatch):
+    destination=host_dir/'vault.db'; original=__import__('os').link
+    def raced(source,target):
+        destination.write_bytes(b'winner')
+        return original(source,target)
+    monkeypatch.setattr('memhub.vault.os.link',raced)
+    with pytest.raises(Conflict): memhub.create_vault(destination)
+    assert destination.read_bytes()==b'winner'
+
+
+def test_open_removal_race_never_recreates(host_dir, monkeypatch):
+    destination=host_dir/'vault.db'; memhub.create_vault(destination)
+    original=sqlite3.connect
+    def raced(*args,**kwargs):
+        destination.unlink()
+        return original(*args,**kwargs)
+    monkeypatch.setattr('memhub.vault.sqlite3.connect',raced)
+    with pytest.raises(Missing): memhub.open_vault(destination)
+    assert not destination.exists()
+
+
+def test_schema_rejects_direct_invalid_rows_and_updates(host_dir):
+    path=host_dir/'vault.db'; memhub.create_vault(path)
+    with memhub.open_vault(path) as vault:
+        with pytest.raises(sqlite3.IntegrityError):
+            vault.connection.execute("INSERT INTO entries(parent_id,name,kind,content,created_at,updated_at) VALUES(1,'bad/name','file','x','t','t')")
+        with pytest.raises(sqlite3.IntegrityError):
+            vault.connection.execute("INSERT INTO entries(parent_id,name,kind,content,created_at,updated_at) VALUES(1,'null','file',NULL,'t','t')")
+        vault.connection.rollback()
+        with pytest.raises(sqlite3.IntegrityError):
+            vault.connection.execute("UPDATE entries SET content='bad' WHERE parent_id IS NULL")
+
+
+def test_open_rejects_missing_schema_object_and_bad_root(host_dir):
+    path=host_dir/'vault.db'; memhub.create_vault(path)
+    raw=sqlite3.connect(path); raw.execute('DROP TRIGGER entries_content_update'); raw.commit(); raw.close()
+    with pytest.raises(VaultFailure) as bad: memhub.open_vault(path)
+    assert bad.value.code=='schema_validation_failed'
+
+
+def test_open_rejects_named_noop_trigger_lookalike(host_dir):
+    path = host_dir / 'vault.db'
+    memhub.create_vault(path)
+    raw = sqlite3.connect(path)
+    raw.execute('DROP TRIGGER entries_content_update')
+    raw.execute('CREATE TRIGGER entries_content_update BEFORE UPDATE OF content ON entries BEGIN SELECT 1; END')
+    raw.commit()
+    raw.close()
+    with pytest.raises(VaultFailure) as bad:
+        memhub.open_vault(path)
+    assert bad.value.code == 'schema_validation_failed'
+
+
+def test_create_staging_file_remains_exclusively_owned_until_publication(host_dir, monkeypatch):
+    destination = host_dir / 'vault.db'
+    real_connect = sqlite3.connect
+
+    def inspect_connect(path, *args, **kwargs):
+        if not str(path).startswith('file:'):
+            staged = __import__('pathlib').Path(path)
+            assert staged.exists()
+            assert staged.stat().st_mode & 0o777 == 0o600
+        return real_connect(path, *args, **kwargs)
+
+    monkeypatch.setattr('memhub.vault.sqlite3.connect', inspect_connect)
+    memhub.create_vault(destination)
+    assert destination.is_file()
+
+
 def test_schema_sql_is_a_packaged_resource():
     text = (
         importlib.resources.files("memhub")

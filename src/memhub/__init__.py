@@ -26,7 +26,8 @@ from .documents import (
     write_file,
     write_in_transaction,
 )
-from .models import Edit, ListResult
+from .models import Edit, ListResult, ImportResult, ImportWarning
+from .importer import import_source
 from .tree import list_entries, remove_entry
 from .vault import Vault, create_vault, open_vault
 
@@ -45,6 +46,9 @@ __all__ = [
     "read_file",
     "list_entries",
     "remove_entry",
+    "import_source",
+    "ImportResult",
+    "ImportWarning",
     "MemhubError",
     "InvalidInput",
     "Missing",

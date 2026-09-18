@@ -148,6 +148,38 @@ def test_empty_bytes_decode_as_utf8():
     assert result.confidence == 1.0
 
 
+def test_utf8_bom_is_consumed_only_when_raw_bytes_start_with_it():
+    # A U+FEFF that decodes out of ordinary UTF-8 text (not a leading EF BB BF)
+    # is genuine content and must be preserved, never stripped.
+    data = "a\ufeffb".encode("utf-8")
+    assert data[0] != 0xEF  # sanity: no leading UTF-8 BOM
+    result = decode_bytes(data)
+    assert result.encoding == "utf-8"
+    assert result.text == "a\ufeffb"
+
+
+def test_detector_path_preserves_genuine_leading_bom_char():
+    # A leading U+FEFF that is NOT a consumed signature (the detector path) must
+    # be preserved, per the spec: only a recognized BOM signature is consumed.
+    # The shared flag-routing switch lives in _finish(consume_bom=...); a public
+    # detector byte fixture for a genuine leading signature is unavailable
+    # because Unicode-signature encodings are intercepted before the detector,
+    # so exercise the seam directly and prove consume_bom=False keeps the char.
+    result = encoding._finish("\ufeffrest", "latin-1", 0.9, consume_bom=False)
+    assert result.text == "\ufeffrest"
+    assert result.text[0] == "\ufeff"
+
+
+def test_nonnumeric_confidence_is_rejected(monkeypatch):
+    # A detector confidence that is not numeric cannot be reported honestly; map
+    # it to Unsupported rather than letting a float() coercion escape.
+    monkeypatch.setattr(
+        encoding, "_detect_encoding", lambda data: {"encoding": "latin-1", "confidence": "high"}
+    )
+    with pytest.raises(Unsupported):
+        decode_bytes(b"\xfe" + "rest".encode("latin-1"))
+
+
 # --- Detector seam: legacy, uncertain, unknown, failure --------------------
 
 
