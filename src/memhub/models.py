@@ -19,7 +19,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Optional
 
-__all__ = ["Entry", "WriteResult", "ReadResult", "ListResult", "Edit"]
+__all__ = ["Entry", "WriteResult", "ReadResult", "ListResult", "Edit", "DecodedText"]
 
 
 @dataclass(frozen=True)
@@ -106,3 +106,19 @@ class Edit:
     old_text: str
     new_text: str
     replace_all: bool = False
+
+
+@dataclass(frozen=True)
+class DecodedText:
+    """The result of :func:`memhub.encoding.decode_bytes`.
+
+    ``text`` is the fully decoded Unicode content with any consumed signature
+    BOM removed. ``encoding`` is the canonical codec label (for example
+    ``"utf-8"``, ``"utf-16-le"``, ``"cp1252"``). ``confidence`` is a 0.0-1.0
+    float: deterministic BOM and UTF-8 inputs report ``1.0``; detector guesses
+    report the detector's confidence.
+    """
+
+    text: str
+    encoding: str
+    confidence: float
