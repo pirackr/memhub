@@ -5,6 +5,12 @@ Run deterministic warm-cache profiles:
 ```sh
 .venv/bin/python -m benchmarks.run small --seed 20260917 --output benchmarks/results/v1-small.json
 .venv/bin/python -m benchmarks.run scale --seed 20260917 --output benchmarks/results/v1-scale.json
+
+# Put the disposable fixture child on a specific disk-backed mount. The parent
+# is retained; only the runner-created memhub-bench-* child is removed.
+mkdir -p /home/pirackr/.cache/memhub-bench-ssd
+.venv/bin/python -m benchmarks.run small --work-dir /home/pirackr/.cache/memhub-bench-ssd --seed 20260917 --output benchmarks/results/v1-small-ssd.json
+.venv/bin/python -m benchmarks.run scale --work-dir /home/pirackr/.cache/memhub-bench-ssd --seed 20260917 --output benchmarks/results/v1-scale-ssd.json
 ```
 
 Small is 1,000 documents/10,000,000 input bytes; scale is 100,000 documents/1,000,000,000 bytes. Reports preserve raw samples, median/nearest-rank p95, environment, throughput inputs, peak RSS, live database/filesystem sizes, journal observations, checks, and caveats. SQLite uses rollback journal/FULL synchronous durability. Ordinary-file mutations fsync file and parent and serialize in-process, but bulk copying has no equivalent multi-file atomic rollback. Native timestamps/IDs are excluded from equivalence.
@@ -16,3 +22,5 @@ Storage evidence comes from `findmnt` and, where exposed, Linux block-device rot
 ## Recorded observations
 
 The regenerated scale run completed 100,000 documents / 1,000,000,000 input bytes in 629.41 s overall on detected tmpfs. Every ordinary operation has 30 actual samples and bulk ingestion has three actual samples in all four mode/backend combinations. The live SQLite file was 1,093,283,840 bytes (9.33% over source bytes), versus 1,000,000,000 bytes of file content. Fast-open median was 0.102 ms; explicit full-audit median was 458.79 ms. Warm library medians were 0.225 ms versus 0.038 ms for whole reads, and 40.76 s for atomic SQLite bulk ingestion versus 22.70 s for non-atomic ordinary-file bulk copying. Fresh-process CLI whole-read median was 56.72 ms. These are workload-specific tmpfs measurements, not SSD evidence, parity, or a universal-speed claim.
+
+The disk-backed scale run completed in 1,235.84 s on `/home`, reported as Btrfs `compress=zstd:3` on non-rotational `/dev/nvme0n1` (WD_BLACK SN7100 2TB). Scale median comparisons (SSD vs prior tmpfs) were: SQLite library whole-read 0.228 vs 0.225 ms; filesystem library whole-read 0.039 vs 0.038 ms; SQLite CLI whole-read 55.65 vs 56.72 ms; filesystem CLI whole-read 45.69 vs 41.76 ms. Bulk medians were SQLite library 42.30 vs 40.76 s, filesystem library 116.62 vs 22.70 s, SQLite CLI 41.15 vs 40.19 s, and filesystem CLI 116.07 vs 22.72 s. These warm-cache results do not measure cold I/O or verify power-loss behavior. Btrfs zstd compression and repetitive generated text mean reported logical input/file bytes are not physical allocated size. Filesystem bulk ingestion fsyncs per file but is not an atomic multi-file operation. Results are workload- and host-specific, not universal SSD speed claims.

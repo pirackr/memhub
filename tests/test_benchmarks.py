@@ -2,7 +2,7 @@ from pathlib import Path
 import hashlib
 from benchmarks.corpus import generate_corpus
 from benchmarks.filesystem import FilesystemStore
-from benchmarks.run import validate_report, OPS, MODES, _stats
+from benchmarks.run import validate_report, OPS, MODES, _stats, _storage
 from memhub.models import Edit
 
 
@@ -21,6 +21,91 @@ def test_filesystem_backend_workload(tmp_path):
         w=s.write_file('/x','a\r\nb',if_absent=True); assert s.read_file('/x',2,1).content=='b'
         w=s.edit_file('/x',[Edit('b','c')],if_match=w.content_hash); assert s.read_file('/x').content=='a\r\nc'
         s.remove_entry('/docs',recursive=True)
+
+
+def test_main_propagates_explicit_work_dir(monkeypatch, tmp_path):
+    import benchmarks.run as runner
+    seen=[]
+    monkeypatch.setattr(runner,'run_profile',lambda *args,**kwargs: seen.append((args,kwargs)))
+    output=tmp_path/'report.json'; work_root=tmp_path/'ssd-work'
+    assert runner.main(['small','--seed','17','--output',str(output),'--work-dir',str(work_root)])==0
+    assert seen==[(('small',17,output),{'work_dir':work_root})]
+
+
+def test_run_profile_cleans_own_child_after_corpus_failure(monkeypatch, tmp_path):
+    import benchmarks.run as runner
+    import pytest
+    parent=tmp_path/'ssd-work'; parent.mkdir(); sentinel=parent/'keep'; sentinel.write_text('unrelated')
+    output=tmp_path/'outside'/'report.json'
+    def fail(corpus,*args):
+        assert corpus.parent.parent==parent
+        assert corpus.parent.name.startswith('memhub-bench-')
+        raise RuntimeError('injected corpus failure')
+    monkeypatch.setattr(runner,'generate_corpus',fail)
+    with pytest.raises(RuntimeError,match='injected corpus failure'):
+        runner.run_profile('small',17,output,work_dir=parent)
+    assert sentinel.read_text()=='unrelated'
+    assert list(parent.iterdir())==[sentinel]
+    assert not output.exists()
+
+
+def test_run_profile_cleans_own_child_after_success(monkeypatch, tmp_path):
+    import contextlib, io, sys
+    import benchmarks.run as runner
+    from benchmarks import filesystem
+    from memhub import cli
+
+    parent=tmp_path/'ssd-work'; parent.mkdir(); sentinel=parent/'keep'; sentinel.write_text('unrelated')
+    output=tmp_path/'outside'/'report.json'
+    monkeypatch.setattr(runner,'SMALL',(2,300))
+
+    def fake_timed(cmd,stdin=None,journal=None):
+        module=cmd[cmd.index('-m')+1]
+        argv=cmd[cmd.index(module)+1:]
+        raw=io.BytesIO((stdin or '').encode())
+        fake_stdin=io.TextIOWrapper(raw,encoding='utf-8')
+        original_stdin=sys.stdin
+        try:
+            sys.stdin=fake_stdin
+            with contextlib.redirect_stdout(io.StringIO()):
+                result=(cli.main(argv) if module=='memhub' else filesystem.main(argv))
+        finally:
+            sys.stdin=original_stdin
+        assert result==0
+        return .001,7,1
+
+    monkeypatch.setattr(runner,'_timed_cmd',fake_timed)
+    report=runner.run_profile('small',17,output,work_dir=parent)
+    assert report['corpus']['document_count']==2
+    assert output.is_file() and parent not in output.parents
+    assert sentinel.read_text()=='unrelated'
+    assert list(parent.iterdir())==[sentinel]
+
+
+def test_storage_btrfs_nvme_partition_evidence(monkeypatch):
+    import json, subprocess
+    replies=[
+      {'filesystems':[{'source':'/dev/nvme0n1p2[/@home]','target':'/home','fstype':'btrfs','options':'rw,compress=zstd:3'}]},
+      {'blockdevices':[{'name':'nvme0n1p2','kname':'nvme0n1p2','pkname':'nvme0n1','type':'part','rota':False,'model':None}]},
+      {'blockdevices':[{'name':'nvme0n1','kname':'nvme0n1','pkname':None,'type':'disk','rota':False,'model':'WD_BLACK SN7100 2TB'}]},
+    ]
+    def fake_run(*args,**kwargs): return subprocess.CompletedProcess(args[0],0,json.dumps(replies.pop(0)),'')
+    monkeypatch.setattr(subprocess,'run',fake_run)
+    found=_storage('/home/example')
+    assert found['mount_source']=='/dev/nvme0n1p2[/@home]'
+    assert found['mount_options']=='rw,compress=zstd:3'
+    assert found['block_device']=='/dev/nvme0n1'
+    assert found['block_model']=='WD_BLACK SN7100 2TB'
+    assert found['rotational']=='non-rotational'
+
+
+def test_storage_fallback_keeps_unknown_physical_evidence(monkeypatch):
+    import subprocess
+    def fail(*args,**kwargs): raise subprocess.CalledProcessError(1,args[0])
+    monkeypatch.setattr(subprocess,'run',fail)
+    found=_storage('/not-provable')
+    assert found['mount_source']=='unknown' and found['block_device']=='unknown'
+    assert found['block_model']=='unknown' and found['rotational']=='unknown'
 
 
 def test_statistics_and_report_validation():

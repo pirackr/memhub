@@ -26,15 +26,50 @@ def _cpu():
     except OSError: pass
     return platform.processor() or 'unknown'
 def _storage(path):
-    result={'mount_source':'unknown','mount_target':'unknown','filesystem_type':'unknown','rotational':'unknown'}
+    """Return only storage properties the host tools can substantiate."""
+    result={'mount_source':'unknown','mount_target':'unknown','filesystem_type':'unknown',
+            'mount_options':'unknown','block_device':'unknown','block_model':'unknown','rotational':'unknown'}
     try:
-        fields=subprocess.run(['findmnt','-no','SOURCE,TARGET,FSTYPE','-T',str(path)],capture_output=True,text=True,check=True).stdout.strip().split()
-        if len(fields) >= 3: result.update(mount_source=fields[0],mount_target=fields[1],filesystem_type=fields[2])
-        device=Path(result['mount_source']).name.rstrip('0123456789')
-        rotational=Path('/sys/class/block')/device/'queue/rotational'
-        if rotational.exists(): result['rotational']='rotational' if rotational.read_text().strip()=='1' else 'non-rotational'
-    except (OSError,subprocess.SubprocessError): pass
+        payload=json.loads(subprocess.run(
+            ['findmnt','-J','-o','SOURCE,TARGET,FSTYPE,OPTIONS','-T',str(path)],
+            capture_output=True,text=True,check=True).stdout)
+        mount=payload['filesystems'][0]
+        result.update(mount_source=mount.get('source') or 'unknown',
+                      mount_target=mount.get('target') or 'unknown',
+                      filesystem_type=mount.get('fstype') or 'unknown',
+                      mount_options=mount.get('options') or 'unknown')
+    except (OSError,subprocess.SubprocessError,ValueError,KeyError,IndexError,TypeError):
+        return result
+    # Btrfs reports e.g. /dev/nvme0n1p2[/@home].  Strip the subvolume,
+    # never partition digits (which are significant for NVMe device names).
+    source=result['mount_source'].split('[',1)[0]
+    if not source.startswith('/dev/'):
+        return result
+    try:
+        current=source
+        model='unknown'; rota=None; backing=None
+        while current:
+            payload=json.loads(subprocess.run(
+                ['lsblk','-J','-o','NAME,KNAME,PKNAME,TYPE,ROTA,MODEL',current],
+                capture_output=True,text=True,check=True).stdout)
+            block=payload['blockdevices'][0]
+            backing='/dev/'+(block.get('kname') or block.get('name'))
+            if block.get('model'): model=str(block['model']).strip() or model
+            if block.get('rota') is not None: rota=bool(block['rota'])
+            parent=block.get('pkname')
+            if not parent: break
+            current='/dev/'+parent
+        result.update(block_device=backing or 'unknown',block_model=model,
+                      rotational=('rotational' if rota else 'non-rotational') if rota is not None else 'unknown')
+    except (OSError,subprocess.SubprocessError,ValueError,KeyError,IndexError,TypeError):
+        pass
     return result
+
+def _make_workdir(work_dir=None):
+    parent=None if work_dir is None else Path(work_dir)
+    if parent is not None:
+        parent.mkdir(parents=True,exist_ok=True)
+    return Path(tempfile.mkdtemp(prefix='memhub-bench-',dir=parent))
 
 def _peak_rss(pid):
     try:
@@ -60,12 +95,12 @@ def _run(cmd,stdin=None,journal=None):
 def _timed_cmd(cmd,stdin=None,journal=None):
     start=time.perf_counter(); rss,journal_size=_run(cmd,stdin,journal); return time.perf_counter()-start,rss,journal_size
 
-def run_profile(profile,seed,output):
+def run_profile(profile,seed,output,work_dir=None):
     if profile not in ('small','scale'): raise ValueError('profile must be small or scale')
     count,target=SMALL if profile=='small' else SCALE
     samples=30
     bulk_samples=3
-    work=Path(tempfile.mkdtemp(prefix='memhub-bench-')); started=time.perf_counter()
+    work=_make_workdir(work_dir); started=time.perf_counter()
     try:
         corpus=work/'corpus'; manifest=generate_corpus(corpus,count,target,seed)
         vault_path=work/'vault.db'; create_vault(vault_path); fsroot=work/'files'
@@ -161,7 +196,7 @@ def run_profile(profile,seed,output):
         detector_seconds=time.perf_counter()-t
         storage=_storage(work)
         env={'python':platform.python_version(),'sqlite':sqlite3.sqlite_version,'chardet':__import__('chardet').__version__,'platform':platform.platform(),'cpu':_cpu(),'logical_cpus':os.cpu_count(),'memory_bytes':os.sysconf('SC_PAGE_SIZE')*os.sysconf('SC_PHYS_PAGES'),'filesystem':storage['filesystem_type'],'storage':storage,'cache_policy':'warm OS cache; no global cache dropping','durability':{'sqlite':'rollback journal DELETE, synchronous FULL, atomic transactions','filesystem':'file and parent-directory fsync per mutation; bulk is durable per file but not atomic'}}
-        report={'report_version':2,'profile':profile,'environment':env,'corpus':{'seed':seed,'document_count':manifest.document_count,'input_bytes':manifest.input_bytes},'metrics':metrics,'validation_phases':{'fast_open':_stats(fast_open),'full_audit':_stats(full_audit)},'resources':{'runner_peak_rss_kib':resource.getrusage(resource.RUSAGE_SELF).ru_maxrss,'peak_cli_rss_kib':peak_child,'database_bytes':vault_path.stat().st_size,'filesystem_bytes':_size(fsroot),'peak_journal_bytes':peak_journal},'throughput':{'sqlite_library_documents_per_second':count/statistics.median(sqlite_bulk),'filesystem_library_documents_per_second':count/statistics.median(fs_bulk),'sqlite_cli_documents_per_second':count/statistics.median(sqlite_cli_bulk),'filesystem_cli_documents_per_second':count/statistics.median(filesystem_cli_bulk)},'encoding_detection':{'method':'decoding only; source reads and destination writes excluded','direct_utf8_documents':count,'direct_utf8_seconds':utf8_seconds,'legacy_detector_documents':len(legacy_data),'legacy_detector_seconds':detector_seconds},'checks':{'sqlite_files':ir.files,'filesystem_files':fr.files,'hash_manifest_entries':len(manifest.documents)},'caveats':['Warm OS caches; fresh process does not imply cold cache.','Storage medium is reported only when the OS exposes it; tmpfs or unknown media are not described as SSD.','Filesystem bulk import is durable per file but has no equivalent multi-file rollback.','Every ordinary operation has 30 samples and every bulk ingestion has three samples in every mode.'],'elapsed_seconds':time.perf_counter()-started}
+        report={'report_version':2,'profile':profile,'environment':env,'corpus':{'seed':seed,'document_count':manifest.document_count,'input_bytes':manifest.input_bytes},'metrics':metrics,'validation_phases':{'fast_open':_stats(fast_open),'full_audit':_stats(full_audit)},'resources':{'runner_peak_rss_kib':resource.getrusage(resource.RUSAGE_SELF).ru_maxrss,'peak_cli_rss_kib':peak_child,'database_bytes':vault_path.stat().st_size,'filesystem_bytes':_size(fsroot),'peak_journal_bytes':peak_journal},'throughput':{'sqlite_library_documents_per_second':count/statistics.median(sqlite_bulk),'filesystem_library_documents_per_second':count/statistics.median(fs_bulk),'sqlite_cli_documents_per_second':count/statistics.median(sqlite_cli_bulk),'filesystem_cli_documents_per_second':count/statistics.median(filesystem_cli_bulk)},'encoding_detection':{'method':'decoding only; source reads and destination writes excluded','direct_utf8_documents':count,'direct_utf8_seconds':utf8_seconds,'legacy_detector_documents':len(legacy_data),'legacy_detector_seconds':detector_seconds},'checks':{'sqlite_files':ir.files,'filesystem_files':fr.files,'hash_manifest_entries':len(manifest.documents)},'caveats':['Warm OS caches; fresh process does not imply cold cache.','Storage medium is reported only when the OS exposes it; tmpfs or unknown media are not described as SSD.','Btrfs zstd compression and repetitive generated text mean logical bytes are not allocated physical size.','Warm-cache disk-backed measurements are not cold-I/O or power-loss verification.','Filesystem bulk import is durable per file but has no equivalent multi-file rollback.','Every ordinary operation has 30 samples and every bulk ingestion has three samples in every mode.'],'elapsed_seconds':time.perf_counter()-started}
         validate_report(report,count,target); output=Path(output); output.parent.mkdir(parents=True,exist_ok=True); output.write_text(json.dumps(report,indent=2)); return report
     finally: shutil.rmtree(work,ignore_errors=True)
 
@@ -191,5 +226,5 @@ def validate_report(report,expected_count,expected_bytes):
 
 def main(argv=None):
     import argparse
-    p=argparse.ArgumentParser(); p.add_argument('profile',choices=['small','scale']); p.add_argument('--seed',type=int,default=20260917); p.add_argument('--output',type=Path,required=True); a=p.parse_args(argv); run_profile(a.profile,a.seed,a.output); return 0
+    p=argparse.ArgumentParser(); p.add_argument('profile',choices=['small','scale']); p.add_argument('--seed',type=int,default=20260917); p.add_argument('--output',type=Path,required=True); p.add_argument('--work-dir',type=Path,help='existing or created parent for the disposable benchmark directory'); a=p.parse_args(argv); run_profile(a.profile,a.seed,a.output,work_dir=a.work_dir); return 0
 if __name__=='__main__': raise SystemExit(main())
