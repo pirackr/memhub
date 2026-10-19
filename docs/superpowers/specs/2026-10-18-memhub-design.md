@@ -30,13 +30,21 @@ bytes verbatim.
 ## Goals (v1)
 
 - A Python CLI that operates on a SQLite database as the raw store.
-- Filesystem-flavored operations, path-addressed:
-  - `write` a memory at a path (content from argument, stdin, or a
-    file path). Writing an existing path overwrites it, like a file.
-  - `read` a memory by path.
-  - `ls` a directory (and recursively) to list what's stored.
-  - `rm` a memory (and, as a builder call, a whole subtree).
+- Filesystem-flavored operations, path-addressed, using the familiar
+  filesystem command names as the primary commands — the partner asked
+  for real fs names so they are easy to recall:
+  - `cp <src> <path>` to write a memory (src is a local file path or
+    `-` for stdin; a trailing `/` on the destination means "into this
+    directory", keeping the source basename, like `cp`). Copying an
+    existing path overwrites it, like a file. Also copies between
+    paths inside the store.
+  - `cat <path>` to read a memory (raw bytes to stdout, like `cat`).
+  - `ls` a directory (and recursively with `-R`) to list what's stored.
+  - `rm` a memory (and, as a builder call, a whole subtree with `-r`).
+  - `mv` to rename/move a memory within the store.
+  - `stat <path>` for JSON metadata about one memory.
   - `init` to create a new store.
+  - `mkdir` accepted as a no-op convenience (directories are implicit).
 - Directory support: paths form a hierarchy; `ls` on a directory prefix
   lists its contents. Directories are implicit from path prefixes — no
   `mkdir` needed (builder call, mirrors git/URL semantics).
@@ -113,6 +121,8 @@ bytes verbatim.
 - v1 focus: write a file, read a file, directory support.
 - Path-addressed memories with directory hierarchy as the organization
   (partner approved the path model over opaque ids + tags).
+- CLI uses real filesystem command names (`cp`, `cat`, `ls`, `rm`,
+  `mv`, `stat`) for easy recall.
 
 ## Left to the builder
 
@@ -124,14 +134,13 @@ bytes verbatim.
   components, arbitrary other characters allowed. Following the
   filesystem guidance, a path cannot be both a memory and a directory
   prefix for other memories — writes that collide are rejected.
-- Read contract (builder call): `read` streams raw content to stdout
-  like `cat` (binary-safe); JSON metadata for a single record comes from
-  `stat`, and `ls` emits JSON. This keeps agents' file reads byte-exact
-  while preserving machine-readable output everywhere else.
+- Read contract (builder call): `cat` streams raw content to stdout
+  (binary-safe); JSON metadata for a single record comes from `stat`,
+  and `ls` emits JSON. This keeps agents' file reads byte-exact while
+  preserving machine-readable output everywhere else.
 - Whether overwrite keeps any history (suggested: no — overwrite is
   overwrite in v1; history is a later layer's problem).
-- CLI command names and flags (suggested fs-style: `write`, `read`,
-  `ls`, `rm`, `init`, maybe `cat` alias).
+- CLI flags beyond the fs-standard ones already listed (`-R`, `-r`).
 - Config format and location (suggested: `~/.memhub/config.toml` with a
   default store path plus named stores; `MEMHUB_DB` env override).
 - Packaging, tests, and distribution details.
