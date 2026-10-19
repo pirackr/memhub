@@ -1,7 +1,7 @@
 [project]
 name = "memhub"
 version = "0.1.0"
-description = "Add your description here"
+description = "Raw memory store for AI agents: path-addressed memories in SQLite"
 readme = "README.md"
 authors = [
     { name = "pirackr", email = "pirackr.inbox@gmail.com" }
