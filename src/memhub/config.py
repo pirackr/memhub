@@ -14,8 +14,6 @@ Config format::
 """
 
 import os
-import tempfile
-import tomllib
 from pathlib import Path
 
 import tomli_w
@@ -38,6 +36,8 @@ def _expand(raw: str) -> Path:
 
 def _load_config() -> dict:
     """Load and validate the config file; {} if it does not exist."""
+    import tomllib
+
     path = config_path()
     if not path.exists():
         return {}
@@ -97,6 +97,10 @@ def register_store(name: str, db_path: Path, set_default: bool) -> None:
         data["default_store"] = name
     path = config_path()
     path.parent.mkdir(parents=True, exist_ok=True)
+    import tempfile
+
+    import tomli_w
+
     fd, tmp_name = tempfile.mkstemp(dir=path.parent, prefix=".config-", suffix=".toml")
     try:
         with os.fdopen(fd, "wb") as f:

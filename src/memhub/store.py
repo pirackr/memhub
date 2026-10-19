@@ -1,12 +1,10 @@
 """SQLite-backed storage for memhub."""
 
 import sqlite3
-import uuid
 from contextlib import contextmanager
-from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import ContextManager, Iterator
+from typing import ContextManager, Iterator, NamedTuple
 
 _SCHEMA = """\
 CREATE TABLE IF NOT EXISTS memories (
@@ -64,8 +62,7 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
 
 
-@dataclass(frozen=True)
-class Memory:
+class Memory(NamedTuple):
     """A stored memory record (metadata only, no content)."""
 
     id: str
@@ -201,6 +198,8 @@ def put(
             (text, blob, ctype, len(data), now, memory_id),
         )
     else:
+        import uuid
+
         memory_id = uuid.uuid4().hex
         created_at = now
         conn.execute(
@@ -242,8 +241,7 @@ def stat(conn: sqlite3.Connection, path: str) -> Memory:
     return _row_to_memory(row)
 
 
-@dataclass(frozen=True)
-class Entry:
+class Entry(NamedTuple):
     """An ls result: a memory, or an implicit directory (memory is None)."""
 
     path: str
