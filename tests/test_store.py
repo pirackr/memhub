@@ -1,6 +1,8 @@
 import sqlite3
 
-from memhub.store import init_store, open_store
+import pytest
+
+from memhub.store import MemhubError, init_store, normalize_path, open_store
 
 _INSERT = (
     "INSERT INTO memories (id, path, content, blob, content_type, size, "
@@ -8,6 +10,28 @@ _INSERT = (
     "VALUES ('x', '/x', 'c', NULL, 'text/plain', 1, "
     "'2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')"
 )
+
+
+def test_normalize_path_adds_leading_slash():
+    assert normalize_path("a/b") == "/a/b"
+
+
+def test_normalize_path_strips_trailing_slash():
+    assert normalize_path("/a/b/") == "/a/b"
+
+
+def test_normalize_path_root():
+    assert normalize_path("/") == "/"
+
+
+@pytest.mark.parametrize("bad", ["a//b", "a/../b", "a/./b", ""])
+def test_normalize_path_rejects_invalid(bad):
+    with pytest.raises(MemhubError):
+        normalize_path(bad)
+
+
+def test_normalize_path_unicode_and_spaces_pass_through():
+    assert normalize_path("/notes/été 2026.md") == "/notes/été 2026.md"
 
 
 def test_init_store_creates_db(tmp_path):

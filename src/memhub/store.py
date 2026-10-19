@@ -25,6 +25,32 @@ class MemhubError(Exception):
     """Base error for memhub storage operations."""
 
 
+def normalize_path(p: str) -> str:
+    """Normalize and validate a memory path.
+
+    The result always starts with '/' and has no trailing slash, except the
+    root '/' itself. Paths are case-sensitive; components may contain any
+    character except '/'.
+
+    Raises MemhubError if p is empty, contains '.' or '..' components, or
+    contains empty components (double slashes, including a trailing '//').
+    """
+    if not p:
+        raise MemhubError("path must not be empty")
+    if "//" in p:
+        raise MemhubError(f"invalid path {p!r}: empty component")
+    if p != "/" and p.endswith("/"):
+        p = p[:-1]
+    body = p[1:] if p.startswith("/") else p
+    if body == "":
+        return "/"
+    components = body.split("/")
+    for c in components:
+        if c in (".", ".."):
+            raise MemhubError(f"invalid path {p!r}: '.'/'..' component not allowed")
+    return "/" + "/".join(components)
+
+
 def init_store(db_path: Path) -> None:
     """Create the SQLite file and schema (idempotent)."""
     conn = sqlite3.connect(db_path)
