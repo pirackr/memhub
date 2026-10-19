@@ -223,6 +223,132 @@ def stat(conn: sqlite3.Connection, path: str) -> Memory:
     return _row_to_memory(row)
 
 
+@dataclass(frozen=True)
+class Entry:
+    """An ls result: a memory, or an implicit directory (memory is None)."""
+
+    path: str
+    is_dir: bool
+    memory: Memory | None = None
+
+
+def _descendant_rows(conn: sqlite3.Connection, prefix: str) -> list[tuple]:
+    """All memory rows under prefix (a normalized path plus trailing '/')."""
+    return conn.execute(
+        f"SELECT {_COLUMNS} FROM memories WHERE substr(path, 1, ?) = ? "
+        "ORDER BY path",
+        (len(prefix), prefix),
+    ).fetchall()
+
+
+def ls(conn: sqlite3.Connection, path: str, recursive: bool = False) -> list[Entry]:
+    """List entries at path, sorted by path.
+
+    ls on a memory path returns that single entry. On a directory (the root,
+    or any path with descendants), non-recursive lists immediate children --
+    memories plus implicit directories -- and recursive lists all descendant
+    memories. An empty directory (the root of an empty store) yields [].
+
+    Raises MemhubError if path is neither a memory nor a directory (no
+    memory, no descendants).
+    """
+    p = normalize_path(path)
+    if is_memory(conn, p):
+        return [Entry(p, False, stat(conn, p))]
+    if p != "/" and not has_descendants(conn, p):
+        raise MemhubError(f"no memory or directory at {p!r}")
+    prefix = "/" if p == "/" else p + "/"
+    rows = _descendant_rows(conn, prefix)
+    if recursive:
+        return [Entry(r[1], False, _row_to_memory(r)) for r in rows]
+    entries: dict[str, Entry] = {}
+    for row in rows:
+        rest = row[1][len(prefix):]
+        head = rest.split("/")[0]
+        child = prefix + head
+        if rest == head:
+            entries[child] = Entry(child, False, _row_to_memory(row))
+        else:
+            entries.setdefault(child, Entry(child, True, None))
+    return sorted(entries.values(), key=lambda e: e.path)
+
+
+def rm(conn: sqlite3.Connection, path: str, recursive: bool = False) -> int:
+    """Delete the memory at path, returning 1.
+
+    With recursive=True, delete the whole subtree below a directory path and
+    return the number of memories removed. Without recursive, a directory with
+    descendants raises, as does a missing path. The root '/' is a directory,
+    never a memory, and can never be removed.
+
+    The caller owns the transaction (open_store commits on clean exit).
+    """
+    p = normalize_path(path)
+    if p == "/":
+        raise MemhubError("cannot remove root '/'")
+    if is_memory(conn, p):
+        conn.execute("DELETE FROM memories WHERE path = ?", (p,))
+        return 1
+    if has_descendants(conn, p):
+        if not recursive:
+            raise MemhubError(
+                f"{p!r} is a directory with descendants; use recursive=True"
+            )
+        prefix = p + "/"
+        cur = conn.execute(
+            "DELETE FROM memories WHERE substr(path, 1, ?) = ?",
+            (len(prefix), prefix),
+        )
+        return cur.rowcount
+    raise MemhubError(f"no memory at {p!r}")
+
+
+def mv(conn: sqlite3.Connection, src: str, dst: str) -> Memory:
+    """Move the memory at src to dst, returning its updated metadata.
+
+    The moved record keeps its id and created_at; path and updated_at are
+    refreshed. Moving a memory onto its own path is a no-op. If dst already holds a memory it is replaced: dst's old row is
+    deleted and the moved record takes its place, keeping the moved record's
+    id. Collision rules match put: an ancestor of dst must not be a memory,
+    and dst must not be an ancestor of other memories (src itself excluded).
+    The root '/' can never be moved to or from.
+
+    Raises MemhubError if src is missing or is not a memory, or on any
+    collision. The caller owns the transaction (open_store commits on clean
+    exit).
+    """
+    s = normalize_path(src)
+    d = normalize_path(dst)
+    if s == "/" or d == "/":
+        raise MemhubError("cannot move to or from root '/'")
+    if not is_memory(conn, s):
+        raise MemhubError(f"no memory at {s!r}")
+    if s == d:
+        return stat(conn, d)  # no-op move
+    for ancestor in _proper_ancestors(d):
+        if is_memory(conn, ancestor):
+            raise MemhubError(
+                f"cannot move to {d!r}: ancestor {ancestor!r} is a memory"
+            )
+    prefix = d + "/"
+    conflict = conn.execute(
+        "SELECT path FROM memories WHERE substr(path, 1, ?) = ? AND path != ? "
+        "LIMIT 1",
+        (len(prefix), prefix, s),
+    ).fetchone()
+    if conflict is not None:
+        raise MemhubError(
+            f"cannot move to {d!r}: it is a directory (memories exist below it)"
+        )
+    now = _now()
+    conn.execute("DELETE FROM memories WHERE path = ?", (d,))
+    conn.execute(
+        "UPDATE memories SET path = ?, updated_at = ? WHERE path = ?",
+        (d, now, s),
+    )
+    return stat(conn, d)
+
+
 def init_store(db_path: Path) -> None:
     """Create the SQLite file and schema (idempotent)."""
     conn = sqlite3.connect(db_path)
