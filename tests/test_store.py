@@ -5,7 +5,6 @@ import pytest
 
 from memhub import store
 from memhub.store import (
-    Entry,
     Memory,
     MemhubError,
     content_type_for,
@@ -433,3 +432,111 @@ def test_mv_normalizes_paths(conn, seeded):
     moved = mv(conn, "a.md", "c.md/")
     assert moved.path == "/c.md"
     assert read_content(conn, "/c.md") == b"alpha"
+
+
+# --- write serialization (collision invariant under concurrency) -----------
+
+
+def test_put_validation_runs_inside_write_transaction(tmp_path):
+    """With another connection holding BEGIN IMMEDIATE, put must fail rather
+    than silently passing validation -- it cannot be allowed to validate
+    outside the write lock and later commit a colliding path.
+    """
+    db = tmp_path / "s.sqlite"
+    init_store(db)
+    with open_store(db) as conn:
+        conn.execute("PRAGMA busy_timeout = 50")
+        blocker = sqlite3.connect(db)
+        try:
+            blocker.execute("BEGIN IMMEDIATE")
+            with pytest.raises(sqlite3.OperationalError):
+                put(conn, "/x", b"x")
+        finally:
+            blocker.rollback()
+            blocker.close()
+
+
+def test_mutating_functions_validate_inside_write_transaction(tmp_path, monkeypatch):
+    """put/mv/rm must take the write lock (BEGIN IMMEDIATE) *before* their
+    validation SELECTs, so validate+write pairs serialize across processes.
+
+    Without it, two processes can both pass the collision checks (each on
+    data the other has not committed yet) and both commit, leaving /a and
+    /a/b coexisting -- a state the design declares impossible.
+    """
+    db = tmp_path / "s.sqlite"
+    init_store(db)
+    real = store.is_memory
+    seen = []
+
+    def spy(conn, path):
+        seen.append(conn.in_transaction)
+        return real(conn, path)
+
+    monkeypatch.setattr(store, "is_memory", spy)
+    with open_store(db) as conn:
+        put(conn, "/a/b", b"x")
+        mv(conn, "/a/b", "/a/c")
+        rm(conn, "/a/c")
+    assert seen and all(seen), "validation SELECTs must run inside a write transaction"
+
+
+# --- schema constraints ------------------------------------------------------
+
+
+def test_schema_rejects_row_without_content_or_blob(conn):
+    with pytest.raises(sqlite3.IntegrityError):
+        conn.execute(
+            "INSERT INTO memories (id, path, content, blob, content_type, size, "
+            "created_at, updated_at) "
+            "VALUES ('n', '/n', NULL, NULL, 'text/plain', 0, "
+            "'2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')"
+        )
+
+
+# --- open_store / init_store: creation and versioning ----------------------
+
+
+def test_open_store_does_not_create_missing_file(tmp_path):
+    db = tmp_path / "missing.sqlite"
+    with pytest.raises(MemhubError, match="no store at"):
+        with open_store(db):
+            pass
+    assert not db.exists()
+
+
+def test_init_store_stamps_version_on_fresh_store(tmp_path):
+    db = tmp_path / "s.sqlite"
+    init_store(db)
+    conn = sqlite3.connect(db)
+    try:
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == store._SCHEMA_VERSION
+    finally:
+        conn.close()
+
+
+def test_init_store_does_not_touch_user_version_of_existing_store(tmp_path):
+    db = tmp_path / "s.sqlite"
+    init_store(db)
+    conn = sqlite3.connect(db)
+    conn.execute(_INSERT)
+    conn.execute("PRAGMA user_version = 0")  # simulate a pre-versioning store
+    conn.commit()
+    conn.close()
+    init_store(db)  # idempotent re-init must not re-stamp
+    conn = sqlite3.connect(db)
+    try:
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == 0
+    finally:
+        conn.close()
+
+
+def test_init_store_rejects_newer_version(tmp_path):
+    db = tmp_path / "s.sqlite"
+    init_store(db)
+    conn = sqlite3.connect(db)
+    conn.execute(f"PRAGMA user_version = {store._SCHEMA_VERSION + 1}")
+    conn.commit()
+    conn.close()
+    with pytest.raises(MemhubError, match="newer memhub version"):
+        init_store(db)

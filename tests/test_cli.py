@@ -8,6 +8,8 @@ temp dir, capturing stdout/stderr/stdin as raw bytes so byte-exactness of
 import io
 import json
 import os
+import shlex
+import subprocess
 import sys
 import tomllib
 from pathlib import Path
@@ -356,3 +358,152 @@ def test_unknown_command_exit_2(memhub_env):
 def test_no_command_exit_2(memhub_env):
     code, out, err = run([])
     assert code == 2
+
+
+# --- store path arguments must be absolute (CLI boundary) -------------------
+
+
+def test_cp_relative_dest_rejected(memhub_env, tmp_path):
+    run(["init"])
+    f = tmp_path / "out.txt"
+    f.write_bytes(b"x")
+    code, out, err = run(["cp", str(f), "exported.txt"])
+    assert code == 1
+    assert b"must start with /" in err
+    assert b"Traceback" not in err
+    code, out, err = run(["ls"])
+    assert jout(out) == []
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["mv", "a.txt", "/b.txt"],
+        ["mv", "/a.txt", "b.txt"],
+        ["cat", "a.txt"],
+        ["ls", "a.txt"],
+        ["rm", "a.txt"],
+        ["stat", "a.txt"],
+        ["mkdir", "a.txt"],
+    ],
+)
+def test_relative_store_path_args_rejected(memhub_env, argv):
+    run(["init"])
+    code, out, err = run(argv)
+    assert code == 1
+    assert b"must start with /" in err
+    assert b"Traceback" not in err
+
+
+# --- missing store file -------------------------------------------------------
+
+
+def test_missing_store_file_clean_error(memhub_env, tmp_path, monkeypatch):
+    missing = tmp_path / "nope" / "store.sqlite"
+    monkeypatch.setenv("MEMHUB_DB", str(missing))
+    code, out, err = run(["ls"])
+    assert code == 1
+    assert b"Traceback" not in err
+    assert err.startswith(b"memhub: ")
+    assert str(missing).encode() in err
+    assert not missing.exists()
+
+
+# --- non-UTF-8 path arguments --------------------------------------------------
+
+
+def test_non_utf8_path_arg_clean_error(memhub_env):
+    run(["init"])
+    code, out, err = run(["cat", "/bad\udcff"])
+    assert code == 1
+    assert b"Traceback" not in err
+    assert b"invalid characters" in err
+
+
+# --- broken pipe ----------------------------------------------------------------
+
+_SWEEP_SCRIPT = "import sys; from memhub.cli import main; sys.exit(main())"
+
+
+def _cli_subprocess(argv, env):
+    return subprocess.run(
+        [sys.executable, "-c", _SWEEP_SCRIPT, *argv],
+        capture_output=True,
+        env=env,
+    )
+
+
+def test_cat_broken_pipe_no_traceback(memhub_env):
+    run(["init"])
+    run(["cp", "-", "/big"], stdin=b"x" * 200_000)
+    cmd = (
+        shlex.join([sys.executable, "-c", _SWEEP_SCRIPT])
+        + " cat /big | head -c 5"
+    )
+    proc = subprocess.run(["sh", "-c", cmd], capture_output=True, env=dict(os.environ))
+    assert proc.returncode in (0, 141)
+    assert b"Traceback" not in proc.stderr
+
+
+# --- init re-registration rules -------------------------------------------------
+
+
+def test_init_repoint_existing_store_rejected(memhub_env, tmp_path):
+    code, out, err = run(["init", "work"])
+    assert code == 0
+    registered = jout(out)["path"]
+    other = tmp_path / "elsewhere" / "work.sqlite"
+    code, out, err = run(["init", "work", "--path", str(other)])
+    assert code == 1
+    assert b"already registered" in err
+    assert registered.encode() in err
+    assert b"Traceback" not in err
+    assert not other.exists()
+
+
+def test_init_same_path_is_idempotent(memhub_env):
+    code, out, err = run(["init", "work"])
+    path = jout(out)["path"]
+    code, out, err = run(["init", "work", "--path", path])
+    assert code == 0
+    assert jout(out)["path"] == path
+
+
+# --- no-traceback guarantee sweep ------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "case",
+    ["corrupt-db", "missing-store", "non-utf8-path", "relative-path", "broken-pipe"],
+)
+def test_no_traceback_sweep(memhub_env, tmp_path, case):
+    """Every known error class exits cleanly from a real process."""
+    env = dict(os.environ)
+    argv = ["ls"]
+    if case == "corrupt-db":
+        bad = tmp_path / "corrupt.sqlite"
+        bad.write_bytes(b"definitely not a sqlite database\x00\xff" * 16)
+        env["MEMHUB_DB"] = str(bad)
+    elif case == "missing-store":
+        env["MEMHUB_DB"] = str(tmp_path / "missing.sqlite")
+    elif case == "non-utf8-path":
+        run(["init"])
+        argv = ["cat", "/bad\udcff"]
+    elif case == "relative-path":
+        run(["init"])
+        argv = ["cat", "relative.txt"]
+    elif case == "broken-pipe":
+        run(["init"])
+        run(["cp", "-", "/big"], stdin=b"x" * 200_000)
+        cmd = (
+            shlex.join([sys.executable, "-c", _SWEEP_SCRIPT])
+            + " cat /big | head -c 5"
+        )
+        proc = subprocess.run(["sh", "-c", cmd], capture_output=True, env=env)
+        assert proc.returncode in (0, 141)
+        assert b"Traceback" not in proc.stderr
+        return
+    proc = _cli_subprocess(argv, env)
+    assert proc.returncode == 1
+    assert b"Traceback" not in proc.stderr
+    assert proc.stderr.startswith(b"memhub: ")

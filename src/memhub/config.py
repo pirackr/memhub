@@ -73,6 +73,17 @@ def resolve_store() -> Path:
     return _expand(raw)
 
 
+def get_registered_path(name: str) -> Path | None:
+    """Return the registered path of store `name`, or None if not registered."""
+    stores = _load_config().get("stores") or {}
+    raw = stores.get(name)
+    if raw is None:
+        return None
+    if not isinstance(raw, str):
+        raise MemhubError(f"store {name!r} path must be a string")
+    return _expand(raw)
+
+
 def register_store(name: str, db_path: Path, set_default: bool) -> None:
     """Register a store in the config file, creating/updating it atomically.
 

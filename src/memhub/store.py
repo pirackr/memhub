@@ -17,7 +17,8 @@ CREATE TABLE IF NOT EXISTS memories (
   content_type TEXT NOT NULL,
   size INTEGER NOT NULL,
   created_at TEXT NOT NULL,
-  updated_at TEXT NOT NULL
+  updated_at TEXT NOT NULL,
+  CHECK (content IS NOT NULL OR blob IS NOT NULL)
 );
 """
 
@@ -35,8 +36,10 @@ def normalize_path(p: str) -> str:
     root '/' itself. Paths are case-sensitive; components may contain any
     character except '/'.
 
-    Raises MemhubError if p is empty, contains '.' or '..' components, or
-    contains empty components (double slashes, including a trailing '//').
+    Raises MemhubError if p is empty, contains '.' or '..' components,
+    contains empty components (double slashes, including a trailing '//'), or
+    contains surrogate codepoints (non-UTF-8 bytes arriving via argv's
+    surrogateescape, which sqlite3 cannot bind).
     """
     if not p:
         raise MemhubError("path must not be empty")
@@ -49,6 +52,8 @@ def normalize_path(p: str) -> str:
         return "/"
     components = body.split("/")
     for c in components:
+        if any("\ud800" <= ch <= "\udfff" for ch in c):
+            raise MemhubError("path contains invalid characters")
         if c in (".", ".."):
             raise MemhubError(f"invalid path {p!r}: '.'/'..' component not allowed")
     return "/" + "/".join(components)
@@ -126,6 +131,19 @@ def _proper_ancestors(p: str) -> list[str]:
     return ["/".join(parts[:i]) for i in range(2, len(parts))]
 
 
+def _begin_write(conn: sqlite3.Connection) -> None:
+    """Start a write transaction immediately, unless one is already open.
+
+    Python's default transaction handling defers BEGIN until the first DML
+    statement, so the collision-validation SELECTs in put/rm/mv would
+    otherwise run outside any lock and two processes could both pass them and
+    both commit colliding paths. BEGIN IMMEDIATE takes the write lock up
+    front, serializing validate+write pairs; open_store commits on clean exit.
+    """
+    if not conn.in_transaction:
+        conn.execute("BEGIN IMMEDIATE")
+
+
 def put(
     conn: sqlite3.Connection,
     path: str,
@@ -147,6 +165,7 @@ def put(
     p = normalize_path(path)
     if p == "/":
         raise MemhubError("cannot write a memory at root '/'")
+    _begin_write(conn)
     for ancestor in _proper_ancestors(p):
         if is_memory(conn, ancestor):
             raise MemhubError(
@@ -286,6 +305,7 @@ def rm(conn: sqlite3.Connection, path: str, recursive: bool = False) -> int:
     p = normalize_path(path)
     if p == "/":
         raise MemhubError("cannot remove root '/'")
+    _begin_write(conn)
     if is_memory(conn, p):
         conn.execute("DELETE FROM memories WHERE path = ?", (p,))
         return 1
@@ -321,6 +341,7 @@ def mv(conn: sqlite3.Connection, src: str, dst: str) -> Memory:
     d = normalize_path(dst)
     if s == "/" or d == "/":
         raise MemhubError("cannot move to or from root '/'")
+    _begin_write(conn)
     if not is_memory(conn, s):
         raise MemhubError(f"no memory at {s!r}")
     if s == d:
@@ -350,11 +371,24 @@ def mv(conn: sqlite3.Connection, src: str, dst: str) -> Memory:
 
 
 def init_store(db_path: Path) -> None:
-    """Create the SQLite file and schema (idempotent)."""
+    """Create the SQLite file and schema (idempotent).
+
+    This is the only function that creates a store file. PRAGMA user_version
+    is stamped only on a fresh store: an existing store's version marker is
+    never rewritten or downgraded (layer 2 will depend on it for migrations),
+    and a store from a newer memhub version is rejected.
+    """
     conn = sqlite3.connect(db_path)
     try:
+        version = conn.execute("PRAGMA user_version").fetchone()[0]
+        if version > _SCHEMA_VERSION:
+            raise MemhubError("store was created by a newer memhub version")
+        has_memories = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'memories'"
+        ).fetchone()
         conn.executescript(_SCHEMA)
-        conn.execute(f"PRAGMA user_version = {_SCHEMA_VERSION}")
+        if has_memories is None:
+            conn.execute(f"PRAGMA user_version = {_SCHEMA_VERSION}")
         conn.commit()
     finally:
         conn.close()
@@ -372,7 +406,12 @@ def open_store(db_path: Path) -> ContextManager[sqlite3.Connection]:
 
 @contextmanager
 def _open_store(db_path: Path) -> Iterator[sqlite3.Connection]:
-    conn = sqlite3.connect(db_path)
+    path = Path(db_path)
+    if not path.exists():
+        raise MemhubError(f"no store at {path}; run memhub init")
+    # mode=rw: sqlite3 would otherwise silently create an empty database.
+    # init_store is the only creator.
+    conn = sqlite3.connect(path.resolve().as_uri() + "?mode=rw", uri=True)
     try:
         conn.execute("PRAGMA journal_mode=WAL")
         yield conn

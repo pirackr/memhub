@@ -59,6 +59,18 @@ def _print_json(obj) -> None:
     print(json.dumps(obj, ensure_ascii=False))
 
 
+def _store_path_arg(arg: str) -> str:
+    """Reject store-path CLI args that do not start with '/'.
+
+    Applied at the CLI boundary only; store.normalize_path stays lenient for
+    library callers. Without this, `memhub cp /out.txt exported.txt`
+    silently writes /exported.txt into the store instead of exporting.
+    """
+    if not arg.startswith("/"):
+        raise MemhubError(f"store path must start with /: {arg}")
+    return arg
+
+
 # --- commands ---------------------------------------------------------------
 
 
@@ -68,6 +80,12 @@ def _cmd_init(args) -> int:
         db_path = Path(os.path.expandvars(os.path.expanduser(args.path)))
     else:
         db_path = config.config_path().parent / f"{name}.sqlite"
+    existing = config.get_registered_path(name)
+    if existing is not None and existing.resolve() != db_path.resolve():
+        raise MemhubError(
+            f"store {name!r} already registered at {existing}; "
+            "edit the config to move it"
+        )
     db_path.parent.mkdir(parents=True, exist_ok=True)
     init_store(db_path)
     config.register_store(name, db_path, set_default=False)
@@ -77,6 +95,10 @@ def _cmd_init(args) -> int:
 
 def _cmd_cp(args) -> int:
     src, dest = args.src, args.dest
+    _store_path_arg(dest)
+    # Resolve the store before reading stdin: a missing store must fail
+    # immediately instead of appearing to hang waiting for input.
+    db_path = config.resolve_store()
     if src == "-":
         data: bytes | None = sys.stdin.buffer.read()
         base: str | None = None
@@ -99,7 +121,7 @@ def _cmd_cp(args) -> int:
         dest_path = dest + base
     else:
         dest_path = dest
-    with open_store(config.resolve_store()) as conn:
+    with open_store(db_path) as conn:
         if store_src is not None:
             data = read_content(conn, store_src)
         mem = put(conn, dest_path, data, content_type=args.content_type)
@@ -108,8 +130,8 @@ def _cmd_cp(args) -> int:
 
 
 def _cmd_cat(args) -> int:
+    p = normalize_path(_store_path_arg(args.path))
     with open_store(config.resolve_store()) as conn:
-        p = normalize_path(args.path)
         if not is_memory(conn, p):
             if has_descendants(conn, p):
                 raise MemhubError(f"{p!r} is a directory; use ls")
@@ -120,35 +142,40 @@ def _cmd_cat(args) -> int:
 
 
 def _cmd_ls(args) -> int:
+    path = _store_path_arg(args.path)
     with open_store(config.resolve_store()) as conn:
-        entries = ls(conn, args.path, recursive=args.R)
+        entries = ls(conn, path, recursive=args.R)
         _print_json([_entry_dict(e) for e in entries])
     return 0
 
 
 def _cmd_rm(args) -> int:
+    path = _store_path_arg(args.path)
     with open_store(config.resolve_store()) as conn:
-        n = rm(conn, args.path, recursive=args.r)
+        n = rm(conn, path, recursive=args.r)
         _print_json({"removed": n})
     return 0
 
 
 def _cmd_mv(args) -> int:
+    src = _store_path_arg(args.src)
+    dest = _store_path_arg(args.dest)
     with open_store(config.resolve_store()) as conn:
-        mem = mv(conn, args.src, args.dest)
+        mem = mv(conn, src, dest)
         _print_json(_memory_dict(mem))
     return 0
 
 
 def _cmd_stat(args) -> int:
+    path = _store_path_arg(args.path)
     with open_store(config.resolve_store()) as conn:
-        _print_json(_memory_dict(stat(conn, args.path)))
+        _print_json(_memory_dict(stat(conn, path)))
     return 0
 
 
 def _cmd_mkdir(args) -> int:
     # Directories are implicit; validate the path and succeed.
-    normalize_path(args.path)
+    normalize_path(_store_path_arg(args.path))
     return 0
 
 
@@ -211,8 +238,20 @@ def main(argv: list[str] | None = None) -> int:
         return exc.code if isinstance(exc.code, int) else 2
     try:
         return args.func(args)
-    except (MemhubError, sqlite3.Error) as exc:
-        # sqlite3.Error covers a corrupt/unopenable database file, so no
+    except BrokenPipeError:
+        # Downstream reader closed the pipe (e.g. `memhub cat X | head`):
+        # exit silently. Redirect stdout to devnull so the shutdown-time
+        # flush of buffered data cannot raise either.
+        devnull = os.open(os.devnull, os.O_WRONLY)
+        try:
+            os.dup2(devnull, sys.stdout.fileno())
+        except (OSError, AttributeError):  # captured stdout in tests has no usable fd
+            pass
+        os.close(devnull)
+        return 0
+    except (MemhubError, sqlite3.Error, UnicodeEncodeError) as exc:
+        # sqlite3.Error covers a corrupt/unopenable database file and
+        # UnicodeEncodeError a non-UTF-8 path reaching an encoder, so no
         # traceback can escape the CLI (project constraint).
         print(f"memhub: {exc}", file=sys.stderr)
         return 1

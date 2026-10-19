@@ -55,7 +55,8 @@ Directories are implicit in paths — `mkdir` is accepted but does nothing.
 | Command | Meaning |
 |---|---|
 | `memhub init [NAME] [--path PATH]` | create a store and register it (first store becomes the default) |
-| `memhub cp SRC DEST` | write a memory from a local file, `-` (stdin), or another store path; `DEST` ending in `/` means "into that directory" |
+| `memhub cp SRC DEST [--content-type TYPE]` | write a memory from a local file, `-` (stdin), or another store path; `DEST` ending in `/` means "into that directory" |
+| `memhub cp --content-type TYPE` | force the stored content type instead of sniffing (default: `text/plain` for valid UTF-8, else `application/octet-stream`) |
 | `memhub cat PATH` | raw bytes to stdout, byte-exact |
 | `memhub ls [PATH] [-R]` | list entries as JSON (`-R` recursive) |
 | `memhub rm PATH [-r]` | remove a memory (`-r` a whole subtree) |
@@ -63,9 +64,11 @@ Directories are implicit in paths — `mkdir` is accepted but does nothing.
 | `memhub stat PATH` | metadata for one memory |
 | `memhub mkdir PATH` | no-op (directories are implicit) |
 
-Store paths always start with `/`; anything else is a local file. All
-commands print JSON on stdout (except `cat`, which prints raw bytes).
-Errors print a message on stderr and exit 1.
+Path rules: for `cp`, `SRC` is read as a **local file** if it exists locally
+(or is `-`, meaning stdin); otherwise it is a store path. Store paths —
+`DEST` and every path argument of `cat`/`ls`/`rm`/`mv`/`stat`/`mkdir` — must
+start with `/`. All commands print JSON on stdout (except `cat`, which prints
+raw bytes). Errors print a message on stderr and exit 1.
 
 ## Store configuration
 
