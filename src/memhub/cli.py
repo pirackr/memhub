@@ -9,6 +9,7 @@ exit 2.
 import argparse
 import json
 import os
+import sqlite3
 import sys
 from pathlib import Path
 
@@ -210,7 +211,9 @@ def main(argv: list[str] | None = None) -> int:
         return exc.code if isinstance(exc.code, int) else 2
     try:
         return args.func(args)
-    except MemhubError as exc:
+    except (MemhubError, sqlite3.Error) as exc:
+        # sqlite3.Error covers a corrupt/unopenable database file, so no
+        # traceback can escape the CLI (project constraint).
         print(f"memhub: {exc}", file=sys.stderr)
         return 1
 

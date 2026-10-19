@@ -247,6 +247,34 @@ def test_ls_empty_store(memhub_env):
     assert jout(out) == []
 
 
+def test_ls_non_ascii_unescaped(memhub_env):
+    run(["init"])
+    run(["cp", "-", "/café/日本語.txt"], stdin="héllo".encode("utf-8"))
+    code, out, err = run(["ls", "-R"])
+    assert code == 0
+    # ensure_ascii=False: raw characters on the wire, no \uXXXX escapes.
+    assert b"\\u" not in out
+    assert "日本語.txt" in out.decode("utf-8")
+    assert "café" in out.decode("utf-8")
+    entries = {e["path"]: e for e in jout(out)}
+    assert entries["/café/日本語.txt"]["size"] == len("héllo".encode("utf-8"))
+
+
+# --- error handling ----------------------------------------------------
+
+
+def test_ls_corrupt_database_no_traceback(memhub_env, tmp_path, monkeypatch):
+    """A database file that is not SQLite must exit 1 without a traceback."""
+    bad = tmp_path / "not-a-db.sqlite"
+    bad.write_bytes(b"this is definitely not a sqlite database\x00\xff" * 8)
+    monkeypatch.setenv("MEMHUB_DB", str(bad))
+    code, out, err = run(["ls"])
+    assert code == 1
+    assert b"Traceback" not in err
+    assert err.startswith(b"memhub: ")
+    assert err.strip() != b""
+
+
 # --- stat -----------------------------------------------------------------
 
 
