@@ -1,3 +1,4 @@
 .pi/
 .envrc 
 .worktrees/
+__pycache__/
