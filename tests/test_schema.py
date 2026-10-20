@@ -1,6 +1,7 @@
 """Schema v2 tests: FTS5 table, sync triggers, version checks."""
 
 import sqlite3
+from contextlib import closing
 
 import pytest
 
@@ -140,7 +141,8 @@ def test_open_store_opens_v1_store_without_migration(tmp_path):
     with open_store(db) as connection:
         assert schema_version(connection) == 1
     # no implicit migration: still v1, no FTS objects
-    assert schema_version(sqlite3.connect(db)) == 1
+    with closing(sqlite3.connect(db)) as check:
+        assert schema_version(check) == 1
     assert "memories_fts" not in _objects(db)
 
 
