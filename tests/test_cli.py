@@ -590,6 +590,13 @@ def test_search_zero_hits_hint_capped_at_ten(memhub_env, tmp_path):
     assert len(paths) == 10
 
 
+def test_search_zero_hits_hint_empty_store(memhub_env):
+    run(["init"])
+    code, out, err = run(["search", "zzznope"])
+    assert code == 0
+    assert jout(out)["hint"] == "no matches; store is empty"
+
+
 def test_search_truncation_hint_and_pagination(memhub_env, tmp_path):
     run(["init"])
     f = tmp_path / "k.txt"
@@ -653,6 +660,29 @@ def test_search_until_date_only_includes_today(memhub_env, tmp_path):
     assert jout(out)["total"] == 0
 
 
+def test_search_until_full_timestamp_inclusive(memhub_env, tmp_path):
+    """--until with a full timestamp includes the second it names: the CLI hands
+    the raw bound to search() instead of pre-normalizing it into an exclusive
+    bound, which would drop the record updated exactly at --until."""
+    code, out, err = run(["init"])
+    db = Path(jout(out)["path"])
+    f = tmp_path / "t.txt"
+    f.write_bytes(b"caribou\n")
+    assert run(["cp", str(f), "/at.txt"])[0] == 0
+    assert run(["cp", str(f), "/after.txt"])[0] == 0
+    conn = sqlite3.connect(db)
+    for path_, ts in (("/at.txt", "2026-03-01T12:00:00Z"),
+                      ("/after.txt", "2026-03-01T12:00:01Z")):
+        conn.execute(
+            "UPDATE memories SET updated_at = ? WHERE path = ?", (ts, path_)
+        )
+    conn.commit()
+    conn.close()
+    code, out, err = run(["search", "caribou", "--until", "2026-03-01T12:00:00Z"])
+    assert code == 0
+    assert [h["path"] for h in jout(out)["hits"]] == ["/at.txt"]
+
+
 def test_search_invalid_bound_names_flag(memhub_env):
     run(["init"])
     code, out, err = run(["search", "x", "--since", "notadate"])
@@ -672,6 +702,33 @@ def test_search_path_filter(memhub_env, tmp_path):
     data = jout(out)
     assert data["total"] == 1
     assert data["hits"][0]["path"] == "/docs/w.txt"
+
+
+def test_search_relative_path_rejected(memhub_env):
+    """--path is a store path: relative paths are rejected like every other
+    command's, instead of silently matching nothing."""
+    run(["init"])
+    code, out, err = run(["search", "foo", "--path", "docs"])
+    assert code == 1
+    assert err.startswith(b"memhub: ")
+    assert b"must start with /" in err
+    assert b"Traceback" not in err
+
+
+def test_search_missing_fts_table_clean_error(memhub_env):
+    """A store whose derived index drifted away must not be reported as a bad
+    query: the sqlite message comes through, still without a traceback."""
+    code, out, err = run(["init"])
+    db = Path(jout(out)["path"])
+    conn = sqlite3.connect(db)
+    conn.execute("DROP TABLE memories_fts")
+    conn.commit()
+    conn.close()
+    code, out, err = run(["search", "widget"])
+    assert code == 1
+    assert b"no such table" in err
+    assert b"invalid search query" not in err
+    assert b"Traceback" not in err
 
 
 def test_search_unbalanced_quote_clean_error(memhub_env):

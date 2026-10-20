@@ -183,14 +183,16 @@ def _cmd_mkdir(args) -> int:
 
 def _cmd_search(args) -> int:
     query = " ".join(args.query)
-    since = search_mod.parse_bound(args.since, "since") if args.since else None
-    until = search_mod.parse_bound(args.until, "until") if args.until else None
+    if args.path is not None:
+        _store_path_arg(args.path)
     with open_store(config.resolve_store()) as conn:
+        # since/until go to search() raw: it normalizes them (see parse_bound),
+        # and a pre-normalized --until would lose the date-only whole-day rule.
         result = search_mod.search(
             conn,
             query,
-            since=since,
-            until=until,
+            since=args.since or None,
+            until=args.until or None,
             path=args.path,
             limit=args.limit,
             offset=args.offset,
@@ -199,7 +201,10 @@ def _cmd_search(args) -> int:
         hint: str | None = None
         if result.total == 0:
             paths = [e.path for e in ls(conn, "/")][:10]
-            hint = "no matches; top-level paths: " + ", ".join(paths)
+            if paths:
+                hint = "no matches; top-level paths: " + ", ".join(paths)
+            else:
+                hint = "no matches; store is empty"
         elif args.offset + len(hits) < result.total:
             hint = (
                 f"{result.total} matches; showing "
@@ -275,8 +280,11 @@ def _build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("search", help="ranked full-text search as JSON")
     p.add_argument("query", nargs="+", help="search terms; quote phrases, word* prefixes")
-    p.add_argument("--since", help="only memories updated on/after this date")
-    p.add_argument("--until", help="only memories updated on/before this date (whole day)")
+    p.add_argument("--since", help="only memories updated on/after this date (inclusive)")
+    p.add_argument(
+        "--until",
+        help="only memories updated on/before this date/timestamp (inclusive)",
+    )
     p.add_argument("--path", help="restrict to this store path subtree")
     p.add_argument("--limit", type=int, default=10, help="max hits, 1-50 (default 10)")
     p.add_argument("--offset", type=int, default=0, help="skip this many hits")

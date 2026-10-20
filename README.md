@@ -3,11 +3,12 @@
 A raw, path-addressed memory store for AI agents. Memories are stored like
 files — `/notes/idea.txt`, `/logs/2026-10-18.md` — inside a single SQLite
 database file, with a filesystem-flavored CLI (`cp`, `cat`, `ls`, `rm`, `mv`,
-`stat`).
+`stat`, `search`).
 
-This is **layer 1: the raw store**. It stores bytes and nothing more — no
-search, no embeddings, no interpretation. Higher layers (retrieval, links,
-summaries) build on top of these records later and never rewrite them.
+The store keeps bytes and nothing more — no embeddings, no interpretation.
+**Layer 2 adds search**: a ranked full-text index over paths and text content,
+kept inside the same file. The index is derived from the records and never
+rewrites them.
 
 ## Install
 
@@ -46,6 +47,11 @@ $ memhub ls
 $ memhub ls -R
 [{"path": "/blog/post.md", "is_dir": false, "content_type": "text/plain", ...},
  {"path": "/notes/groceries.txt", "is_dir": false, "content_type": "text/plain", ...}]
+
+$ memhub search oat
+{"hits": [{"path": "/notes/groceries.txt", "id": "9f2c...", "score": 1.1,
+ "updated_at": "2026-10-18T10:00:00Z", "snippet": "buy more oat milk", "match": "content"}],
+ "total": 1, "hint": null}
 ```
 
 Directories are implicit in paths — `mkdir` is accepted but does nothing.
@@ -63,12 +69,20 @@ Directories are implicit in paths — `mkdir` is accepted but does nothing.
 | `memhub mv SRC DEST` | move/rename a memory |
 | `memhub stat PATH` | metadata for one memory |
 | `memhub mkdir PATH` | no-op (directories are implicit) |
+| `memhub search QUERY... [--since D] [--until D] [--path P] [--limit N] [--offset N]` | ranked full-text search as JSON — `"quoted phrases"`, `prefix*`; `--since`/`--until` are inclusive on `updated_at` (a date-only `--until` covers the whole UTC day); `--path` restricts to a subtree |
+| `memhub reindex` | build or rebuild the search index (the v1 → v2 migration, and the fix for any index drift) |
+
+Search hits carry `path`, `id`, `score`, `updated_at`, `snippet` and `match`
+(`"content"` or `"path"`). Binary memories are indexed by path only, so they
+come back with `match: "path"` and `snippet: null`. A store created before
+layer 2 answers `store is not indexed; run memhub reindex` until you run it.
 
 Path rules: for `cp`, `SRC` is read as a **local file** if it exists locally
 (or is `-`, meaning stdin); otherwise it is a store path. Store paths —
 `DEST` and every path argument of `cat`/`ls`/`rm`/`mv`/`stat`/`mkdir` — must
-start with `/`. All commands print JSON on stdout (except `cat`, which prints
-raw bytes). Errors print a message on stderr and exit 1.
+start with `/` (`search --path` included). All commands print JSON on stdout
+(except `cat`, which prints raw bytes). Errors print a message on stderr and
+exit 1.
 
 ## Store configuration
 
@@ -111,9 +125,10 @@ merge protocol.
 
 ## Design notes
 
-- **Raw store only.** Layer 1 keeps content byte-exact. Higher layers
-  (retrieval, links, embeddings) attach to the same file later via each
-  record's immutable `id` — never by rewriting content or paths.
+- **Raw store first.** Content stays byte-exact. The search index is derived
+  and disposable — `reindex` rebuilds it from `memories`. Higher layers
+  (links, embeddings) attach to the same file later via each record's
+  immutable `id` — never by rewriting content or paths.
 - **Concurrency-safe.** Every command uses a short-lived WAL-mode connection,
   so multiple agents can hit the same store.
 - **Machine-friendly.** JSON on stdout everywhere, so agents can parse it.
