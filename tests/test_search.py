@@ -150,6 +150,28 @@ def test_phrase_requires_adjacency(v2_conn):
 # --- binary / path-only hits -------------------------------------------------
 
 
+def test_text_row_matching_only_in_path_is_path_only(v2_conn):
+    # snippet(memories_fts, 1, ...) returns the START OF CONTENT even when the
+    # match was only in the path column, so an empty snippet does not imply a
+    # path-only hit: content-match has to be probed per row.
+    _seed(v2_conn, "/notes/widget.md", "hello world nothing here")
+    result = search(v2_conn, "widget")
+    assert result.total == 1
+    hit = result.hits[0]
+    assert hit.match == "path"
+    assert hit.snippet is None
+
+
+def test_content_match_still_snippets_when_path_also_matches(v2_conn):
+    # Both columns match: the hit is a content hit and the snippet must hold
+    # the term, not just the head of the document.
+    _seed(v2_conn, "/notes/widget.md", "aaa " * 4 + "widget report follows")
+    result = search(v2_conn, "widget")
+    hit = result.hits[0]
+    assert hit.match == "content"
+    assert "widget" in hit.snippet
+
+
 def test_binary_row_is_path_only(v2_conn):
     _seed(v2_conn, "/images/photo.jpg", b"\x00\x01\x02binary",
           content_type="image/jpeg")
@@ -229,6 +251,27 @@ def test_until_filter_includes_whole_day(v2_conn):
     assert [h.path for h in result.hits] == ["/a.txt"]
 
 
+def test_since_boundary_is_inclusive(v2_conn):
+    _seed(v2_conn, "/at.txt", "keepme text")
+    _set_updated(v2_conn, "/at.txt", "2026-03-01T00:00:00Z")
+    _seed(v2_conn, "/before.txt", "keepme text")
+    _set_updated(v2_conn, "/before.txt", "2026-02-28T23:59:59Z")
+    result = search(v2_conn, "keepme", since="2026-03-01")
+    assert [h.path for h in result.hits] == ["/at.txt"]
+
+
+def test_until_full_timestamp_is_inclusive(v2_conn):
+    # A full-timestamp --until names a second that belongs to the range; only
+    # the next second is excluded. (Date-only --until keeps the exclusive
+    # next-midnight bound: see test_until_filter_includes_whole_day.)
+    _seed(v2_conn, "/at.txt", "keepme text")
+    _set_updated(v2_conn, "/at.txt", "2026-03-01T12:00:00Z")
+    _seed(v2_conn, "/after.txt", "keepme text")
+    _set_updated(v2_conn, "/after.txt", "2026-03-01T12:00:01Z")
+    result = search(v2_conn, "keepme", until="2026-03-01T12:00:00Z")
+    assert [h.path for h in result.hits] == ["/at.txt"]
+
+
 def test_combined_filters(v2_conn):
     _seed(v2_conn, "/a/keep.txt", "needle text")
     _set_updated(v2_conn, "/a/keep.txt", "2026-05-01T00:00:00Z")
@@ -248,6 +291,15 @@ def test_path_prefix_is_component_aware(v2_conn):
     _seed(v2_conn, "/ab.txt", "findme text")
     result = search(v2_conn, "findme", path="/a")
     assert [h.path for h in result.hits] == ["/a/b.txt"]
+
+
+def test_path_prefix_underscore_is_literal(v2_conn):
+    # '_' is a LIKE wildcard; the prefix must be escaped or '/a_b' would also
+    # match '/axb'.
+    _seed(v2_conn, "/a_b/x.txt", "findme text")
+    _seed(v2_conn, "/axb/x.txt", "findme text")
+    result = search(v2_conn, "findme", path="/a_b")
+    assert [h.path for h in result.hits] == ["/a_b/x.txt"]
 
 
 # --- v1 store guard ----------------------------------------------------------
@@ -300,6 +352,9 @@ def test_parse_bound_invalid_format():
 def test_reversed_range_error(v2_conn):
     with pytest.raises(MemhubError, match="since must not be after"):
         search(v2_conn, "x", since="2026-05-01", until="2026-01-01")
+    # the inclusive full-timestamp --until must not swallow a reversed range
+    with pytest.raises(MemhubError, match="since must not be after"):
+        search(v2_conn, "x", since="2026-03-01T12:00:01Z", until="2026-03-01T12:00:00Z")
 
 
 # --- limit / offset validation ----------------------------------------------
@@ -315,6 +370,16 @@ def test_limit_out_of_range(v2_conn):
 def test_negative_offset(v2_conn):
     with pytest.raises(MemhubError, match="offset must not be negative"):
         search(v2_conn, "x", offset=-1)
+
+
+def test_missing_fts_table_is_not_reported_as_bad_query(v2_conn):
+    # A derived index that drifted away (dropped memories_fts) is an operational
+    # problem, not a query problem: only FTS5 syntax failures are relabelled,
+    # everything else reaches the caller as the sqlite error main() renders.
+    _seed(v2_conn, "/a.txt", "widget")
+    v2_conn.execute("DROP TABLE memories_fts")
+    with pytest.raises(sqlite3.OperationalError, match="no such table"):
+        search(v2_conn, "widget")
 
 
 def test_operational_error_from_match_wrapped(v2_conn, monkeypatch):

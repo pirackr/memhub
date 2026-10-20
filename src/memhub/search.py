@@ -110,8 +110,9 @@ def parse_bound(value: str, kind: str) -> str:
     kind is "since" or "until". A date-only 'YYYY-MM-DD' becomes the start of
     that UTC day for 'since', or the start of the NEXT day for 'until' (an
     exclusive upper bound). A full timestamp must carry a timezone ('Z' or
-    '±hh:mm') and is converted to UTC. Anything else raises MemhubError naming
-    the flag.
+    '±hh:mm') and is converted to UTC; search then treats it as an INCLUSIVE
+    bound -- the second it names is part of the range. Anything else raises
+    MemhubError naming the flag.
     """
     flag = f"--{kind}"
     if _DATE_ONLY.match(value):
@@ -132,6 +133,13 @@ def parse_bound(value: str, kind: str) -> str:
         raise MemhubError(f"invalid {flag} timestamp: {value!r}") from exc
     dt = dt.astimezone(timezone.utc)
     return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+# sqlite reports a bad MATCH expression as 'fts5: syntax error near ...' (an
+# unbalanced literal as 'unterminated string'). Every other OperationalError --
+# a missing memories_fts, a locked database -- is an operational problem and
+# must reach the caller as the sqlite error main() renders.
+_FTS_QUERY_MARKERS = ("fts5:", "unterminated string")
 
 
 def _snippet_terms(query: str) -> list[str]:
@@ -179,8 +187,12 @@ def search(
     """Run a ranked FTS5 search with optional date/path filters.
 
     Returns a SearchResult of at most `limit` hits (starting at `offset`) plus
-    the total match count. Raises MemhubError on an unindexed (v1) store, an
-    invalid query, out-of-range limit/offset, or a reversed date range.
+    the total match count. `since`/`until` are raw user bounds (see
+    parse_bound): both ends are inclusive, a path-only match reports
+    `match="path"` with `snippet=None`. Raises MemhubError on an unindexed (v1)
+    store, an invalid query, out-of-range limit/offset, or a reversed date
+    range; a store whose index is missing or a locked database raises the
+    underlying sqlite3 error.
     """
     if schema_version(conn) < 2:
         raise MemhubError("store is not indexed; run memhub reindex")
@@ -193,6 +205,14 @@ def search(
     until_b = parse_bound(until, "until") if until is not None else None
     if since_b is not None and until_b is not None and since_b > until_b:
         raise MemhubError("--since must not be after --until")
+    if until_b is not None and not _DATE_ONLY.match(until):
+        # A full-timestamp --until names a second that belongs to the range.
+        # updated_at is stored at second precision, so '< bound + 1s' is exactly
+        # '<= bound'. (A date-only --until is already the exclusive next
+        # midnight -- the whole-day rule parse_bound documents.)
+        until_b = (
+            datetime.strptime(until_b, "%Y-%m-%dT%H:%M:%SZ") + timedelta(seconds=1)
+        ).strftime("%Y-%m-%dT%H:%M:%SZ")
 
     match_expr = parse_query(query)
 
@@ -204,43 +224,57 @@ def search(
     # score = -bm25 (path weight 10.0, content 1.0), ordered score desc then
     # path then id.
     inner = (
-        "SELECT m.path AS path, m.id AS id, -bm25(memories_fts, 10.0, 1.0) AS score, "
+        "SELECT m.rowid AS rowid, m.path AS path, m.id AS id, "
+        "-bm25(memories_fts, 10.0, 1.0) AS score, "
         "m.updated_at AS updated_at, "
         "snippet(memories_fts, 1, '', '', ' ', 12) AS snip "
         "FROM memories_fts "
         "JOIN memories m ON m.rowid = memories_fts.rowid "
         "WHERE memories_fts MATCH ?"
     )
-    params: list[object] = [match_expr]
+    inner_params: list[object] = [match_expr]
     if since_b is not None:
         inner += " AND m.updated_at >= ?"
-        params.append(since_b)
+        inner_params.append(since_b)
     if until_b is not None:
         inner += " AND m.updated_at < ?"
-        params.append(until_b)
+        inner_params.append(until_b)
     if path is not None:
         p = normalize_path(path)
         esc = p.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
         inner += " AND (m.path = ? OR m.path LIKE ? ESCAPE '\\')"
-        params.append(p)
-        params.append(esc + "/%")
-    sql = (
+        inner_params.append(p)
+        inner_params.append(esc + "/%")
+    page = (
         f"SELECT s.*, count(*) OVER () AS total FROM ({inner}) s "
         "ORDER BY s.score DESC, s.path, s.id LIMIT ? OFFSET ?"
     )
-    inner_params = list(params)
-    params.extend([limit, offset])
+    # snippet() returns the head of the content column even when only the path
+    # matched, so a content hit needs its own verdict: the same expression run
+    # against the content column alone (FTS5 column filter). It sits OUTSIDE
+    # LIMIT/OFFSET on purpose -- once per returned row, not once per match.
+    sql = (
+        "SELECT p.path, p.id, p.score, p.updated_at, p.snip, p.total, "
+        "EXISTS (SELECT 1 FROM memories_fts probe "
+        "WHERE probe.rowid = p.rowid AND probe.content MATCH ?) AS hit_content "
+        f"FROM ({page}) p"
+    )
+    # The probe's '?' sits in the outer SELECT list, i.e. BEFORE every
+    # placeholder of the page subquery, so it binds first.
+    outer_params = [match_expr, *inner_params, limit, offset]
 
     try:
-        rows = conn.execute(sql, params).fetchall()
+        rows = conn.execute(sql, outer_params).fetchall()
     except sqlite3.OperationalError as exc:
+        if not any(marker in str(exc) for marker in _FTS_QUERY_MARKERS):
+            raise
         raise MemhubError("invalid search query") from exc
 
     terms = _snippet_terms(query)
     hits: list[Hit] = []
     total = 0
     if rows:
-        total = rows[0][-1]
+        total = rows[0][5]  # count(*) OVER (), identical on every row
     elif offset > 0:
         # Window count is only present on returned rows; when OFFSET skips
         # every match, re-count the full filtered set so total stays correct.
@@ -249,9 +283,11 @@ def search(
                 f"SELECT count(*) FROM ({inner}) s", inner_params
             ).fetchone()[0]
         except sqlite3.OperationalError as exc:
+            if not any(marker in str(exc) for marker in _FTS_QUERY_MARKERS):
+                raise
             raise MemhubError("invalid search query") from exc
-    for path_, id_, score, updated_at, snip, _ in rows:
-        if snip:
+    for path_, id_, score, updated_at, snip, _, hit_content in rows:
+        if hit_content:
             match = "content"
             snippet: str | None = _truncate_snippet(snip, terms)
         else:
