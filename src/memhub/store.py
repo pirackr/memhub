@@ -43,6 +43,8 @@ END;
 
 _SCHEMA_VERSION = 2
 
+_NEWER_VERSION = "store was created by a newer memhub version"
+
 
 def schema_version(conn: sqlite3.Connection) -> int:
     """The store's PRAGMA user_version."""
@@ -177,11 +179,13 @@ def put(
 
     Overwriting keeps the existing id and created_at and updates content,
     content_type, size and updated_at; a fresh insert gets a new uuid4 id.
-    Routing: an explicit content type starting with 'text/' is decoded
-    strictly as UTF-8 into the content column (blob is NULL); any other
-    explicit type is stored as bytes in the blob column (content is NULL)
-    with no sniff override; with no type given, content_type_for sniffs the
-    data ('text/plain' or 'application/octet-stream').
+    Routing: an explicit content type whose lower-cased form starts with
+    'text/' (the same case-insensitive test the reindex backfill applies with
+    SQL LIKE) is decoded strictly as UTF-8 into the content column (blob is
+    NULL); any other explicit type is stored as bytes in the blob column
+    (content is NULL) with no sniff override; with no type given,
+    content_type_for sniffs the data ('text/plain' or
+    'application/octet-stream').
 
     Raises MemhubError if path is the root, if an ancestor of path is an
     existing memory, if path is an ancestor of existing memories, or if the
@@ -203,7 +207,7 @@ def put(
         )
 
     ctype = content_type if content_type is not None else content_type_for(data)
-    if ctype.startswith("text/"):
+    if ctype.lower().startswith("text/"):
         try:
             text: str | None = data.decode("utf-8")
         except UnicodeDecodeError as exc:
@@ -411,7 +415,7 @@ def init_store(db_path: Path) -> None:
     try:
         version = conn.execute("PRAGMA user_version").fetchone()[0]
         if version > _SCHEMA_VERSION:
-            raise MemhubError("store was created by a newer memhub version")
+            raise MemhubError(_NEWER_VERSION)
         has_memories = conn.execute(
             "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'memories'"
         ).fetchone()
@@ -513,7 +517,7 @@ def _reindex_locked(conn: sqlite3.Connection) -> ReindexReport:
         raise MemhubError("not a memhub store")
     version = schema_version(conn)
     if version > _SCHEMA_VERSION:
-        raise MemhubError("store was created by a newer memhub version")
+        raise MemhubError(_NEWER_VERSION)
     upgraded = version < _SCHEMA_VERSION
     # The index is derived and disposable: tear it down first, including the
     # triggers, so the backfill cannot index a row twice.
@@ -592,7 +596,7 @@ def _open_store(db_path: Path) -> Iterator[sqlite3.Connection]:
     conn = sqlite3.connect(path.resolve().as_uri() + "?mode=rw", uri=True)
     try:
         if schema_version(conn) > _SCHEMA_VERSION:
-            raise MemhubError("store was created by a newer memhub version")
+            raise MemhubError(_NEWER_VERSION)
         conn.execute("PRAGMA journal_mode=WAL")
         yield conn
         conn.commit()

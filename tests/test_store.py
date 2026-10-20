@@ -242,6 +242,20 @@ def test_put_any_text_type_stores_decoded_text(conn):
     assert read_content(conn, "/a.md") == b"# hi"
 
 
+def test_put_content_type_case_does_not_change_routing(conn):
+    # The reindex backfill selects text rows with SQL LIKE 'text/%', which is
+    # case-insensitive for ASCII; put must route identically or 'Text/Markdown'
+    # would sit in blob until someone reindexes.
+    m = put(conn, "/case.md", b"# hi", content_type="Text/Markdown")
+    assert m.content_type == "Text/Markdown"
+    row = conn.execute(
+        "SELECT content, blob FROM memories WHERE path = '/case.md'"
+    ).fetchone()
+    assert row[0] == "# hi"
+    assert row[1] is None
+    assert read_content(conn, "/case.md") == b"# hi"
+
+
 def test_put_overwrite_flips_routing_between_text_and_blob(conn):
     # Overwriting the same path must not leave a stale value in the other
     # column: content is non-NULL iff the stored text lives in `content`.
