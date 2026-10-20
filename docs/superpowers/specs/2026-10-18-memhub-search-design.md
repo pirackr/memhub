@@ -1,9 +1,8 @@
 # memhub — Layer 2 (search) design
 
 Date: 2026-10-18
-Status: draft — awaiting partner review; NOT approved. Only items under
-"Decided by the partner" are user decisions; everything else is a proposed
-engineering default (controller/builder) that the partner may override.
+Status: approved by partner 2026-10-18 (including the three flagged
+defaults: full field names, reindex-based migration, unicode61 tokenizer).
 Builds on: docs/superpowers/specs/2026-10-18-memhub-design.md (layer 1)
 
 ## Intent
@@ -182,7 +181,7 @@ promised by — this design.
 - Scale expectation: thousands of memories, GBs of data, mostly docs,
   occasional PDFs.
 
-## Proposed engineering defaults (not user-approved)
+## Engineering defaults (approved by partner 2026-10-18)
 
 - Full field names in hits (`path`, `id`, `score`, `updated_at`,
   `snippet`, `match`) instead of the earlier cryptic short keys
