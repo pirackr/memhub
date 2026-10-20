@@ -424,6 +424,152 @@ def init_store(db_path: Path) -> None:
         conn.close()
 
 
+class ReindexReport(NamedTuple):
+    """What a reindex run did.
+
+    upgraded: the store was migrated to v2 (user_version was 0 or 1).
+    indexed: rows in the rebuilt index.
+    backfilled: text/* blob rows moved into the content column.
+    invalid_utf8: text/* blob rows kept blob-only (indexed by path).
+    """
+
+    upgraded: bool
+    indexed: int
+    backfilled: int
+    invalid_utf8: int
+
+
+def _iter_ddl(script: str) -> Iterator[str]:
+    """Split a DDL script into complete statements.
+
+    executescript() is unusable here: it commits any pending transaction before
+    running, which would break reindex's all-or-nothing migration. sqlite3's
+    complete_statement tracks CREATE TRIGGER BEGIN/END bodies, so trigger DDL
+    is not split apart.
+    """
+    buf = ""
+    for line in script.splitlines(keepends=True):
+        buf += line
+        if sqlite3.complete_statement(buf):
+            yield buf
+            buf = ""
+    if buf.strip():
+        yield buf
+
+
+def _backfill_text_blobs(conn: sqlite3.Connection) -> tuple[int, int]:
+    """Move pre-Task-1 text blobs into the content column.
+
+    Candidates are v1 rows that claim to be text but keep their bytes in blob
+    (content IS NULL). Each blob is decoded strictly as UTF-8; on success the
+    row keeps id/created_at/updated_at/size and only swaps blob for content.
+    A blob that is not valid UTF-8 is left exactly as it is -- no silent loss --
+    and counted. Returns (backfilled, invalid_utf8).
+
+    Must run with the sync triggers dropped: an UPDATE would otherwise index the
+    row through the trigger and again in the bulk rebuild.
+    """
+    rows = conn.execute(
+        "SELECT rowid, blob FROM memories "
+        "WHERE content_type LIKE 'text/%' AND content IS NULL"
+    ).fetchall()
+    backfilled = 0
+    invalid_utf8 = 0
+    for rowid, blob in rows:
+        try:
+            text = bytes(blob).decode("utf-8")
+        except UnicodeDecodeError:
+            invalid_utf8 += 1
+            continue
+        conn.execute(
+            "UPDATE memories SET content = ?, blob = NULL WHERE rowid = ?",
+            (text, rowid),
+        )
+        backfilled += 1
+    return backfilled, invalid_utf8
+
+
+def _rebuild_index(conn: sqlite3.Connection) -> int:
+    """Fill the empty memories_fts index from memories; return rows indexed.
+
+    One entry per memory: binary rows (content IS NULL) contribute empty
+    content and are therefore findable by path token only.
+    """
+    conn.execute(
+        "INSERT INTO memories_fts(rowid, path, content) "
+        "SELECT rowid, path, coalesce(content, '') FROM memories"
+    )
+    return conn.execute("SELECT count(*) FROM memories").fetchone()[0]
+
+
+def _reindex_locked(conn: sqlite3.Connection) -> ReindexReport:
+    """Migration + rebuild body; the caller holds the write lock."""
+    has_memories = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'memories'"
+    ).fetchone()
+    if has_memories is None:
+        raise MemhubError("not a memhub store")
+    version = schema_version(conn)
+    if version > _SCHEMA_VERSION:
+        raise MemhubError("store was created by a newer memhub version")
+    upgraded = version < _SCHEMA_VERSION
+    # The index is derived and disposable: tear it down first, including the
+    # triggers, so the backfill cannot index a row twice.
+    conn.execute("DROP TRIGGER IF EXISTS memories_ai")
+    conn.execute("DROP TRIGGER IF EXISTS memories_ad")
+    conn.execute("DROP TRIGGER IF EXISTS memories_au")
+    conn.execute("DROP TABLE IF EXISTS memories_fts")
+    backfilled = 0
+    invalid_utf8 = 0
+    if upgraded:
+        backfilled, invalid_utf8 = _backfill_text_blobs(conn)
+    for statement in _iter_ddl(FTS_DDL):
+        conn.execute(statement)
+    indexed = _rebuild_index(conn)
+    if upgraded:
+        conn.execute(f"PRAGMA user_version = {_SCHEMA_VERSION}")
+    return ReindexReport(
+        upgraded=upgraded,
+        indexed=indexed,
+        backfilled=backfilled,
+        invalid_utf8=invalid_utf8,
+    )
+
+
+def reindex(conn: sqlite3.Connection) -> ReindexReport:
+    """Build or rebuild the search index; the only v1 -> v2 migration path.
+
+    On an unindexed store (user_version 0 or 1) this creates the FTS table and
+    triggers, backfills text rows stored as blobs, and stamps user_version 2.
+    On a v2 store it drops and rebuilds the index from memories -- the recovery
+    path for any drift between the derived index and the raw records. Raw
+    records are never re-interpreted: bytes, id, created_at and updated_at are
+    preserved exactly.
+
+    Everything runs in one transaction under BEGIN IMMEDIATE, and the version is
+    re-checked only after the lock is held, so two concurrent migrations
+    serialize: the loser either waits and sees the finished v2 store or fails
+    with sqlite3.OperationalError (database locked). Any failure rolls the whole
+    operation back -- the index is never half-built.
+
+    Like put/rm/mv, the caller owns the transaction: if one is already open this
+    joins it and does not commit. Raises MemhubError if conn is not a memhub
+    store or comes from a newer memhub version.
+    """
+    owns_transaction = not conn.in_transaction
+    if owns_transaction:
+        conn.execute("BEGIN IMMEDIATE")
+    try:
+        report = _reindex_locked(conn)
+    except BaseException:
+        if owns_transaction:
+            conn.rollback()
+        raise
+    if owns_transaction:
+        conn.commit()
+    return report
+
+
 def open_store(db_path: Path) -> ContextManager[sqlite3.Connection]:
     """Open the store with WAL enabled.
 
