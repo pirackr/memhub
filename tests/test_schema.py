@@ -93,6 +93,12 @@ def test_fts_mv_moves_index_entry(conn):
     put(conn, "/a.md", b"widget")
     mv(conn, "/a.md", "/b.md")
     assert _fts_paths(conn, "widget") == ["/b.md"]
+    # Token-level checks: memories_fts is an external-content table, so its
+    # `path` column is resolved from the live row and would read '/b.md' even
+    # with the UPDATE trigger dropped. The indexed *tokens* are what the trigger
+    # maintains: '/a.md' tokenizes to ('a', 'md'), '/b.md' to ('b', 'md').
+    assert _fts_paths(conn, "a") == []
+    assert _fts_paths(conn, "b") == ["/b.md"]
 
 
 def test_fts_rm_removes_index_entry(conn):
