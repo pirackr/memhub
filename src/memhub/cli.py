@@ -14,6 +14,7 @@ import sys
 from pathlib import Path
 
 from . import config
+from . import search as search_mod
 from .store import (
     MemhubError,
     Memory,
@@ -27,6 +28,7 @@ from .store import (
     open_store,
     put,
     read_content,
+    reindex,
     rm,
     stat,
 )
@@ -179,6 +181,50 @@ def _cmd_mkdir(args) -> int:
     return 0
 
 
+def _cmd_search(args) -> int:
+    query = " ".join(args.query)
+    since = search_mod.parse_bound(args.since, "since") if args.since else None
+    until = search_mod.parse_bound(args.until, "until") if args.until else None
+    with open_store(config.resolve_store()) as conn:
+        result = search_mod.search(
+            conn,
+            query,
+            since=since,
+            until=until,
+            path=args.path,
+            limit=args.limit,
+            offset=args.offset,
+        )
+        hits = [h._asdict() for h in result.hits]
+        hint: str | None = None
+        if result.total == 0:
+            paths = [e.path for e in ls(conn, "/")][:10]
+            hint = "no matches; top-level paths: " + ", ".join(paths)
+        elif args.offset + len(hits) < result.total:
+            hint = (
+                f"{result.total} matches; showing "
+                f"{args.offset + 1}-{args.offset + len(hits)}; "
+                "narrow with --since/--until/--path or paginate with --offset"
+            )
+        _print_json({"hits": hits, "total": result.total, "hint": hint})
+    return 0
+
+
+def _cmd_reindex(args) -> int:
+    with open_store(config.resolve_store()) as conn:
+        print("reindexing...", file=sys.stderr)
+        report = reindex(conn)
+        _print_json(
+            {
+                "upgraded": report.upgraded,
+                "indexed": report.indexed,
+                "backfilled": report.backfilled,
+                "invalid_utf8": report.invalid_utf8,
+            }
+        )
+    return 0
+
+
 # --- parser ------------------------------------------------------------------
 
 
@@ -226,6 +272,18 @@ def _build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("mkdir", help="no-op: directories are implicit")
     p.add_argument("path", help="store path")
     p.set_defaults(func=_cmd_mkdir)
+
+    p = sub.add_parser("search", help="ranked full-text search as JSON")
+    p.add_argument("query", nargs="+", help="search terms; quote phrases, word* prefixes")
+    p.add_argument("--since", help="only memories updated on/after this date")
+    p.add_argument("--until", help="only memories updated on/before this date (whole day)")
+    p.add_argument("--path", help="restrict to this store path subtree")
+    p.add_argument("--limit", type=int, default=10, help="max hits, 1-50 (default 10)")
+    p.add_argument("--offset", type=int, default=0, help="skip this many hits")
+    p.set_defaults(func=_cmd_search)
+
+    p = sub.add_parser("reindex", help="build or rebuild the search index")
+    p.set_defaults(func=_cmd_reindex)
 
     return parser
 

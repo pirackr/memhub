@@ -9,14 +9,16 @@ import io
 import json
 import os
 import shlex
+import sqlite3
 import subprocess
 import sys
 import tomllib
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
 
-from memhub import cli, config
+from memhub import cli, config, store
 
 
 @pytest.fixture(autouse=True)
@@ -507,3 +509,229 @@ def test_no_traceback_sweep(memhub_env, tmp_path, case):
     assert proc.returncode == 1
     assert b"Traceback" not in proc.stderr
     assert proc.stderr.startswith(b"memhub: ")
+
+
+# --- search / reindex --------------------------------------------------------
+
+
+def _utc_date(days_from_now: int = 0) -> str:
+    day = datetime.now(timezone.utc) + timedelta(days=days_from_now)
+    return day.strftime("%Y-%m-%d")
+
+
+def _make_v1_store(db: Path) -> None:
+    """Overwrite db with a layer-1 store file (memories table, user_version 1)."""
+    conn = sqlite3.connect(db)
+    conn.executescript(store._SCHEMA)
+    conn.execute("PRAGMA user_version = 1")
+    conn.commit()
+    conn.close()
+
+
+def test_search_end_to_end(memhub_env, tmp_path):
+    run(["init"])
+    a = tmp_path / "a.txt"
+    a.write_bytes(b"widget design notes\n")
+    b = tmp_path / "b.txt"
+    b.write_bytes(b"widget spec\n")
+    assert run(["cp", str(a), "/a.txt"])[0] == 0
+    assert run(["cp", str(b), "/b.txt"])[0] == 0
+    code, out, err = run(["search", "widget"])
+    assert code == 0
+    assert b"Traceback" not in err
+    data = jout(out)
+    assert data["total"] == 2
+    assert len(data["hits"]) == 2
+    assert data["hint"] is None
+    for h in data["hits"]:
+        assert set(h) == {"path", "id", "score", "updated_at", "snippet", "match"}
+        assert h["match"] == "content"
+        assert "widget" in h["snippet"].lower()
+    assert {h["path"] for h in data["hits"]} == {"/a.txt", "/b.txt"}
+
+
+def test_search_multiword_query_joined(memhub_env, tmp_path):
+    """Query words passed as separate args are joined with single spaces."""
+    run(["init"])
+    f = tmp_path / "f.txt"
+    f.write_bytes(b"the widget design is final\n")
+    run(["cp", str(f), "/f.txt"])
+    code, out, err = run(["search", "widget", "design"])
+    assert code == 0
+    assert jout(out)["total"] == 1
+
+
+def test_search_zero_hits_hint(memhub_env, tmp_path):
+    run(["init"])
+    f = tmp_path / "f.txt"
+    f.write_bytes(b"hello\n")
+    run(["cp", str(f), "/alpha.txt"])
+    run(["cp", str(f), "/notes/x.txt"])
+    code, out, err = run(["search", "zzznope"])
+    assert code == 0
+    assert b"Traceback" not in err
+    data = jout(out)
+    assert data["hits"] == []
+    assert data["total"] == 0
+    assert data["hint"] == "no matches; top-level paths: /alpha.txt, /notes"
+
+
+def test_search_zero_hits_hint_capped_at_ten(memhub_env, tmp_path):
+    run(["init"])
+    f = tmp_path / "f.txt"
+    f.write_bytes(b"x\n")
+    for i in range(12):
+        assert run(["cp", str(f), f"/p{i:02}.txt"])[0] == 0
+    code, out, err = run(["search", "zzznope"])
+    assert code == 0
+    hint = jout(out)["hint"]
+    assert hint.startswith("no matches; top-level paths: ")
+    paths = hint[len("no matches; top-level paths: "):].split(", ")
+    assert len(paths) == 10
+
+
+def test_search_truncation_hint_and_pagination(memhub_env, tmp_path):
+    run(["init"])
+    f = tmp_path / "k.txt"
+    f.write_bytes(b"kaleidoscope dreams\n")
+    for i in range(12):
+        assert run(["cp", str(f), f"/docs/k{i:02}.txt"])[0] == 0
+    code, out, err = run(["search", "kaleidoscope"])
+    assert code == 0
+    data = jout(out)
+    assert len(data["hits"]) == 10
+    assert data["total"] == 12
+    assert "12 matches" in data["hint"]
+    assert "showing 1-10" in data["hint"]
+    assert (
+        "narrow with --since/--until/--path or paginate with --offset"
+        in data["hint"]
+    )
+    code, out, err = run(["search", "kaleidoscope", "--offset", "10"])
+    assert code == 0
+    data = jout(out)
+    assert len(data["hits"]) == 2
+    assert data["total"] == 12
+    assert data["hint"] is None
+
+
+@pytest.mark.parametrize(
+    "argv, needle",
+    [
+        (["--limit", "51"], b"limit"),
+        (["--limit", "0"], b"limit"),
+        (["--offset", "-1"], b"offset"),
+    ],
+)
+def test_search_range_validation(memhub_env, argv, needle):
+    run(["init"])
+    code, out, err = run(["search", "anything", *argv])
+    assert code == 1
+    assert err.startswith(b"memhub: ")
+    assert needle in err
+    assert b"Traceback" not in err
+
+
+def test_search_until_date_only_includes_today(memhub_env, tmp_path):
+    """--until YYYY-MM-DD is an inclusive whole-day bound: a doc updated
+    today is found with --until today, and not with --until yesterday."""
+    run(["init"])
+    f = tmp_path / "t.txt"
+    f.write_bytes(b"caribou\n")
+    assert run(["cp", str(f), "/t.txt"])[0] == 0
+    code, out, err = run(["search", "caribou", "--until", _utc_date()])
+    assert code == 0
+    assert jout(out)["total"] == 1
+    code, out, err = run(["search", "caribou", "--until", _utc_date(-1)])
+    assert code == 0
+    assert jout(out)["total"] == 0
+    code, out, err = run(["search", "caribou", "--since", _utc_date()])
+    assert code == 0
+    assert jout(out)["total"] == 1
+    code, out, err = run(["search", "caribou", "--since", _utc_date(1)])
+    assert code == 0
+    assert jout(out)["total"] == 0
+
+
+def test_search_invalid_bound_names_flag(memhub_env):
+    run(["init"])
+    code, out, err = run(["search", "x", "--since", "notadate"])
+    assert code == 1
+    assert b"--since" in err
+    assert b"Traceback" not in err
+
+
+def test_search_path_filter(memhub_env, tmp_path):
+    run(["init"])
+    f = tmp_path / "w.txt"
+    f.write_bytes(b"widget report\n")
+    run(["cp", str(f), "/docs/w.txt"])
+    run(["cp", str(f), "/other/w.txt"])
+    code, out, err = run(["search", "widget", "--path", "/docs"])
+    assert code == 0
+    data = jout(out)
+    assert data["total"] == 1
+    assert data["hits"][0]["path"] == "/docs/w.txt"
+
+
+def test_search_unbalanced_quote_clean_error(memhub_env):
+    run(["init"])
+    code, out, err = run(["search", '"unclosed'])
+    assert code == 1
+    assert b"unbalanced quote" in err
+    assert b"Traceback" not in err
+
+
+def test_search_on_v1_store_points_at_reindex_then_works(memhub_env, tmp_path):
+    code, out, err = run(["init"])
+    db = Path(jout(out)["path"])
+    db.unlink()
+    _make_v1_store(db)
+    f = tmp_path / "n.txt"
+    f.write_bytes(b"widget from v1\n")
+    assert run(["cp", str(f), "/n.txt"])[0] == 0
+    code, out, err = run(["search", "widget"])
+    assert code == 1
+    assert b"reindex" in err
+    assert b"Traceback" not in err
+    code, out, err = run(["reindex"])
+    assert code == 0
+    report = jout(out)
+    assert report["upgraded"] is True
+    assert report["indexed"] == 1
+    code, out, err = run(["search", "widget"])
+    assert code == 0
+    assert jout(out)["total"] == 1
+
+
+def test_reindex_on_v2_reports(memhub_env, tmp_path):
+    run(["init"])
+    f = tmp_path / "f.txt"
+    f.write_bytes(b"rebuild me\n")
+    run(["cp", str(f), "/a.txt"])
+    run(["cp", str(f), "/b.txt"])
+    code, out, err = run(["reindex"])
+    assert code == 0
+    assert b"reindexing..." in err
+    assert b"Traceback" not in err
+    assert jout(out) == {
+        "upgraded": False,
+        "indexed": 2,
+        "backfilled": 0,
+        "invalid_utf8": 0,
+    }
+
+
+def test_reindex_database_locked_clean_error(memhub_env, monkeypatch):
+    """A concurrent writer holding the lock must not produce a traceback."""
+    run(["init"])
+
+    def locked(conn):
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(cli, "reindex", locked)
+    code, out, err = run(["reindex"])
+    assert code == 1
+    assert b"reindexing..." in err
+    assert b"memhub: database is locked" in err
+    assert b"Traceback" not in err
