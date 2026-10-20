@@ -217,23 +217,42 @@ def test_content_type_for_sniffs_utf8():
     assert content_type_for(b"\xff\xfe") == "application/octet-stream"
 
 
-def test_explicit_content_type_override_is_honored(conn):
-    m = put(conn, "/note.md", b"# hi", content_type="text/markdown")
-    assert m.content_type == "text/markdown"
+def test_explicit_non_text_type_has_no_sniff_override(conn):
+    # An explicit non-text type stores bytes in blob even when the bytes
+    # happen to be valid UTF-8 (no sniff override).
+    png_bytes = b"not really a png, but valid UTF-8 text"
+    m = put(conn, "/img.png", png_bytes, content_type="image/png")
+    assert m.content_type == "image/png"
     row = conn.execute(
-        "SELECT content, blob FROM memories WHERE path = '/note.md'"
+        "SELECT content, blob FROM memories WHERE path = '/img.png'"
     ).fetchone()
     assert row[0] is None
-    assert bytes(row[1]) == b"# hi"
-    assert read_content(conn, "/note.md") == b"# hi"
-    # Declaring text/plain routes the same bytes through the text column.
-    m2 = put(conn, "/note.txt", b"# hi", content_type="text/plain")
-    assert m2.content_type == "text/plain"
-    row2 = conn.execute(
-        "SELECT content, blob FROM memories WHERE path = '/note.txt'"
+    assert bytes(row[1]) == png_bytes
+    assert read_content(conn, "/img.png") == png_bytes
+
+
+def test_put_any_text_type_stores_decoded_text(conn):
+    m = put(conn, "/a.md", b"# hi", content_type="text/markdown")
+    assert m.content_type == "text/markdown"
+    row = conn.execute(
+        "SELECT content, blob FROM memories WHERE path = '/a.md'"
     ).fetchone()
-    assert row2[0] == "# hi"
-    assert row2[1] is None
+    assert row[0] == "# hi"
+    assert row[1] is None
+    assert read_content(conn, "/a.md") == b"# hi"
+
+
+def test_put_text_type_with_parameters_rejects_invalid_utf8(conn):
+    # 'text/plain; charset=x' is still text/* (prefix match on 'text/').
+    with pytest.raises(
+        MemhubError,
+        match=r"cannot store '/x\.bin' as text/plain; charset=x: "
+        r"data is not valid UTF-8",
+    ):
+        put(conn, "/x.bin", b"\xff\xfe", content_type="text/plain; charset=x")
+    assert conn.execute(
+        "SELECT count(*) FROM memories WHERE path = '/x.bin'"
+    ).fetchone()[0] == 0
 
 
 def test_record_operations_normalize_paths(conn):

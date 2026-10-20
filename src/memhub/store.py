@@ -151,12 +151,15 @@ def put(
 
     Overwriting keeps the existing id and created_at and updates content,
     content_type, size and updated_at; a fresh insert gets a new uuid4 id.
-    Text ('text/plain') is stored decoded in the content column, anything else
-    as bytes in the blob column.
+    Routing: an explicit content type starting with 'text/' is decoded
+    strictly as UTF-8 into the content column (blob is NULL); any other
+    explicit type is stored as bytes in the blob column (content is NULL)
+    with no sniff override; with no type given, content_type_for sniffs the
+    data ('text/plain' or 'application/octet-stream').
 
     Raises MemhubError if path is the root, if an ancestor of path is an
-    existing memory, if path is an ancestor of existing memories, or if
-    content_type is 'text/plain' but data is not valid UTF-8. The caller owns
+    existing memory, if path is an ancestor of existing memories, or if the
+    content type is text/* but data is not valid UTF-8. The caller owns
     the transaction (open_store commits on clean exit).
     """
     p = normalize_path(path)
@@ -174,12 +177,12 @@ def put(
         )
 
     ctype = content_type if content_type is not None else content_type_for(data)
-    if ctype == "text/plain":
+    if ctype.startswith("text/"):
         try:
             text: str | None = data.decode("utf-8")
         except UnicodeDecodeError as exc:
             raise MemhubError(
-                f"cannot store {p!r} as text/plain: data is not valid UTF-8"
+                f"cannot store {p!r} as {ctype}: data is not valid UTF-8"
             ) from exc
         blob: bytes | None = None
     else:
