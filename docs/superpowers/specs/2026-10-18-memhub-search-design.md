@@ -213,3 +213,43 @@ promised by — this design.
 
 - Exact sanitization rules and tests around FTS5 operator characters.
 - Internal module layout (likely `search.py`) and test structure.
+
+## Benchmark results
+
+Recorded 2026-10-20 by `benchmarks/bench_search.py` (run:
+`uv run python benchmarks/bench_search.py --iters 1 --out
+/tmp/bench_search.json`, Linux, tmpfs-backed store). Data only — no
+thresholds are implied; see "Benchmarks (required)" above.
+
+Corpus: the script's default spec-scale corpus — 2,000 synthetic text
+documents x 250 KB + 50 x 1 MB binary blobs = 538 MB total, ingested
+into a v1 store (no index), then migrated with `memhub reindex`. Half
+the rows were aged 30 days so `--since` filters select ~half the
+corpus. Every number is a full `uv run memhub ...` subprocess
+invocation (process startup included). Index size measured as the
+`pragma_page_count` delta after dropping the index and VACUUMing the
+throwaway store.
+
+| measurement | value |
+| --- | --- |
+| ingest 2,050 memories (no index) | 172 s total, 84 ms/doc |
+| `reindex` v1->v2 build, 2,050 rows / 538 MB | 2.9 s |
+| mutation `put` (100 KB text, triggers active) | 74 ms |
+| mutation `mv` | 71 ms |
+| mutation `rm` | 67 ms |
+| query, common word (matches all 2,002 text docs) | ~3.6 s |
+| query, mid-frequency word (100 docs) | ~195 ms |
+| query, rare word (3 docs) | ~65 ms |
+| query, no match | 138 ms |
+| query, 4-6 word phrase (51-55 docs) | ~196 ms |
+| query, 3-char prefix (100-192 docs) | ~183-304 ms |
+| query, common word + `--since` (1,002 docs) | 1.9 s |
+| query, phrase + `--since` (22 docs) | 184 ms |
+| FTS index size | 116 MB (4,461 terms, 97.8 M term occurrences) |
+| db file with index | 659 MB (corpus 538 MB) |
+
+Observations (not promises): index build and per-mutation trigger cost
+are small at this scale; query latency scales with the size of the
+matched doclist (common words matching every document dominate, and
+`total` counting plus snippet generation ride that doclist); the FTS
+index added ~22% of corpus size.
