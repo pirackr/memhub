@@ -18,7 +18,30 @@ parse_query converts raw user input into a safe FTS5 MATCH expression:
   one term') is raised.
 """
 
-from .store import MemhubError
+import re
+import sqlite3
+from datetime import datetime, timedelta, timezone
+from typing import NamedTuple
+
+from .store import MemhubError, normalize_path, schema_version
+
+
+class Hit(NamedTuple):
+    """One ranked search result."""
+
+    path: str
+    id: str
+    score: float          # higher is better
+    updated_at: str
+    snippet: str | None   # None for path-only (binary) hits
+    match: str            # "content" | "path"
+
+
+class SearchResult(NamedTuple):
+    """A page of hits plus the total match count (before limit/offset)."""
+
+    hits: list[Hit]
+    total: int
 
 
 def _escape(term: str) -> str:
@@ -73,3 +96,175 @@ def parse_query(text: str) -> str:
     if not terms:
         raise MemhubError("search requires at least one term")
     return " AND ".join(terms)
+
+
+# --- ranked search -----------------------------------------------------------
+
+_DATE_ONLY = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+_TZ_SUFFIX = re.compile(r"(Z|[+-]\d{2}:\d{2})$")
+
+
+def parse_bound(value: str, kind: str) -> str:
+    """Normalize a --since/--until bound to UTC second precision '...Z'.
+
+    kind is "since" or "until". A date-only 'YYYY-MM-DD' becomes the start of
+    that UTC day for 'since', or the start of the NEXT day for 'until' (an
+    exclusive upper bound). A full timestamp must carry a timezone ('Z' or
+    '±hh:mm') and is converted to UTC. Anything else raises MemhubError naming
+    the flag.
+    """
+    flag = f"--{kind}"
+    if _DATE_ONLY.match(value):
+        try:
+            day = datetime.strptime(value, "%Y-%m-%d")
+        except ValueError as exc:
+            raise MemhubError(f"invalid {flag} date: {value!r}") from exc
+        if kind == "until":
+            day += timedelta(days=1)
+        return day.strftime("%Y-%m-%dT00:00:00Z")
+    if not _TZ_SUFFIX.search(value):
+        raise MemhubError(
+            f"{flag} timestamp must include a timezone (Z or ±hh:mm): {value!r}"
+        )
+    try:
+        dt = datetime.fromisoformat(value)
+    except ValueError as exc:
+        raise MemhubError(f"invalid {flag} timestamp: {value!r}") from exc
+    dt = dt.astimezone(timezone.utc)
+    return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _snippet_terms(query: str) -> list[str]:
+    """Lowercased words from raw query text, used to locate the match in a
+    snippet for the 200-char truncation. Quotes and trailing '*' are dropped."""
+    out: list[str] = []
+    for tok in re.findall(r'[^"\s]+', query):
+        tok = tok.rstrip("*")
+        if tok and any(c.isalnum() for c in tok):
+            out.append(tok.lower())
+    return out
+
+
+def _truncate_snippet(snip: str, terms: list[str], cap: int = 200) -> str:
+    """Hard-cap a snippet to `cap` chars, keeping the first matched term
+    (case-insensitive) fully inside the returned window."""
+    if len(snip) <= cap:
+        return snip
+    low = snip.lower()
+    best: tuple[int, str] | None = None
+    for t in terms:
+        i = low.find(t)
+        if i != -1 and (best is None or i < best[0]):
+            best = (i, t)
+    if best is None:
+        return snip[:cap]
+    pos, term = best
+    start = max(0, min(pos, len(snip) - cap))
+    end = start + cap
+    if pos + len(term) > end:
+        end = pos + len(term)
+        start = max(0, end - cap)
+    return snip[start:end]
+
+
+def search(
+    conn: sqlite3.Connection,
+    query: str,
+    since: str | None = None,
+    until: str | None = None,
+    path: str | None = None,
+    limit: int = 10,
+    offset: int = 0,
+) -> SearchResult:
+    """Run a ranked FTS5 search with optional date/path filters.
+
+    Returns a SearchResult of at most `limit` hits (starting at `offset`) plus
+    the total match count. Raises MemhubError on an unindexed (v1) store, an
+    invalid query, out-of-range limit/offset, or a reversed date range.
+    """
+    if schema_version(conn) < 2:
+        raise MemhubError("store is not indexed; run memhub reindex")
+    if not isinstance(limit, int) or isinstance(limit, bool) or not 1 <= limit <= 50:
+        raise MemhubError("limit must be between 1 and 50")
+    if not isinstance(offset, int) or isinstance(offset, bool) or offset < 0:
+        raise MemhubError("offset must not be negative")
+
+    since_b = parse_bound(since, "since") if since is not None else None
+    until_b = parse_bound(until, "until") if until is not None else None
+    if since_b is not None and until_b is not None and since_b > until_b:
+        raise MemhubError("--since must not be after --until")
+
+    match_expr = parse_query(query)
+
+    # NOTE: FTS5 auxiliary functions (bm25/snippet) cannot appear in the same
+    # SELECT as a window function in this SQLite build ("unable to use function
+    # bm25 in the requested context"), so bm25/snippet are computed in an inner
+    # query and the window count is applied outside. Behaviour is identical to
+    # the brief's single-level SQL: total = count(*) OVER () over all matches,
+    # score = -bm25 (path weight 10.0, content 1.0), ordered score desc then
+    # path then id.
+    inner = (
+        "SELECT m.path AS path, m.id AS id, -bm25(memories_fts, 10.0, 1.0) AS score, "
+        "m.updated_at AS updated_at, "
+        "snippet(memories_fts, 1, '', '', ' ', 12) AS snip "
+        "FROM memories_fts "
+        "JOIN memories m ON m.rowid = memories_fts.rowid "
+        "WHERE memories_fts MATCH ?"
+    )
+    params: list[object] = [match_expr]
+    if since_b is not None:
+        inner += " AND m.updated_at >= ?"
+        params.append(since_b)
+    if until_b is not None:
+        inner += " AND m.updated_at < ?"
+        params.append(until_b)
+    if path is not None:
+        p = normalize_path(path)
+        esc = p.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        inner += " AND (m.path = ? OR m.path LIKE ? ESCAPE '\\')"
+        params.append(p)
+        params.append(esc + "/%")
+    sql = (
+        f"SELECT s.*, count(*) OVER () AS total FROM ({inner}) s "
+        "ORDER BY s.score DESC, s.path, s.id LIMIT ? OFFSET ?"
+    )
+    inner_params = list(params)
+    params.extend([limit, offset])
+
+    try:
+        rows = conn.execute(sql, params).fetchall()
+    except sqlite3.OperationalError as exc:
+        raise MemhubError("invalid search query") from exc
+
+    terms = _snippet_terms(query)
+    hits: list[Hit] = []
+    total = 0
+    if rows:
+        total = rows[0][-1]
+    elif offset > 0:
+        # Window count is only present on returned rows; when OFFSET skips
+        # every match, re-count the full filtered set so total stays correct.
+        try:
+            total = conn.execute(
+                f"SELECT count(*) FROM ({inner}) s", inner_params
+            ).fetchone()[0]
+        except sqlite3.OperationalError as exc:
+            raise MemhubError("invalid search query") from exc
+    for path_, id_, score, updated_at, snip, _ in rows:
+        if snip:
+            match = "content"
+            snippet: str | None = _truncate_snippet(snip, terms)
+        else:
+            match = "path"
+            snippet = None
+        hits.append(
+            Hit(
+                path=path_,
+                id=id_,
+                score=score,
+                updated_at=updated_at,
+                snippet=snippet,
+                match=match,
+            )
+        )
+    return SearchResult(hits=hits, total=total)
