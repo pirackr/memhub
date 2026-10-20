@@ -242,6 +242,30 @@ def test_put_any_text_type_stores_decoded_text(conn):
     assert read_content(conn, "/a.md") == b"# hi"
 
 
+def test_put_overwrite_flips_routing_between_text_and_blob(conn):
+    # Overwriting the same path must not leave a stale value in the other
+    # column: content is non-NULL iff the stored text lives in `content`.
+    png_bytes = b"not really a png, but valid UTF-8 text"
+    put(conn, "/flip", png_bytes, content_type="image/png")
+    # blob -> text flip via the UPDATE path.
+    put(conn, "/flip", "# hi é".encode("utf-8"), content_type="text/markdown")
+    row = conn.execute(
+        "SELECT content, blob FROM memories WHERE path = '/flip'"
+    ).fetchone()
+    assert row[0] == "# hi é"
+    assert row[1] is None
+    assert read_content(conn, "/flip") == "# hi é".encode("utf-8")
+    # text -> blob flip back, with bytes that are not valid UTF-8.
+    binary = b"\x89PNG\r\n\x1a\n\xff\xfe"
+    put(conn, "/flip", binary, content_type="image/png")
+    row = conn.execute(
+        "SELECT content, blob FROM memories WHERE path = '/flip'"
+    ).fetchone()
+    assert row[0] is None
+    assert bytes(row[1]) == binary
+    assert read_content(conn, "/flip") == binary
+
+
 def test_put_text_type_with_parameters_rejects_invalid_utf8(conn):
     # 'text/plain; charset=x' is still text/* (prefix match on 'text/').
     with pytest.raises(
