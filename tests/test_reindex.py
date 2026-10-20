@@ -39,6 +39,28 @@ def _fts_paths(conn, query):
     )
 
 
+def _vocab(conn):
+    """Term-level postings read straight out of the FTS index.
+
+    fts5vocab scans the index itself, so -- unlike a plain SELECT on the
+    external-content table, which enumerates live `memories` rows and resolves
+    path/content from them -- it reflects what is actually indexed and can
+    detect a stale or corrupt one. 'col' mode is one row per (term, column)
+    with doc = documents containing the term and cnt = total occurrences (the
+    successor of the old 'term' mode's hits/phits columns; current SQLite
+    accepts 'row'/'col'/'instance', not 'rowid'/'term').
+    """
+    conn.execute("DROP TABLE IF EXISTS temp.vocab")
+    conn.execute(
+        "CREATE VIRTUAL TABLE temp.vocab USING fts5vocab(main, memories_fts, col)"
+    )
+    rows = conn.execute(
+        "SELECT term, col, doc, cnt FROM temp.vocab ORDER BY term, col"
+    ).fetchall()
+    conn.execute("DROP TABLE temp.vocab")
+    return rows
+
+
 def _objects(conn):
     return {
         row[0]
@@ -226,18 +248,17 @@ def test_reindex_v2_matches_trigger_maintained_index(tmp_path):
         )
         mv(conn, "/a/two.md", "/a/renamed.md")
         rm(conn, "/b/three.bin")
-        before = conn.execute(
-            "SELECT rowid, path, content FROM memories_fts ORDER BY rowid"
-        ).fetchall()
+        # The control has to be the index itself: `SELECT rowid, path, content
+        # FROM memories_fts` enumerates the live memories rows and would match
+        # before and after no matter how broken the index is.
+        before = _vocab(conn)
+        assert before, "empty vocab would make the comparison vacuous"
         report = reindex(conn)
         assert report == ReindexReport(
             upgraded=False, indexed=2, backfilled=0, invalid_utf8=0
         )
-        after = conn.execute(
-            "SELECT rowid, path, content FROM memories_fts ORDER BY rowid"
-        ).fetchall()
-        assert after == before
-        # no duplicate postings: each term resolves to exactly one row
+        assert _vocab(conn) == before
+        # each term resolves to exactly one row
         assert _fts_paths(conn, "widget") == ["/a/one.md"]
         assert _fts_paths(conn, "gadget") == ["/a/renamed.md"]
         assert _fts_paths(conn, "renamed") == ["/a/renamed.md"]
@@ -275,9 +296,13 @@ def test_reindex_repairs_drifted_index(tmp_path):
             ("d" * 32, "/raw.md", "orphanword", "text/plain", 10, "x", "y"),
         )
         conn.commit()
+        orphan = ("orphanword", "content", 1, 1)
+        assert orphan not in _vocab(conn)  # drifted: absent from the index
         assert _fts_paths(conn, "orphanword") == []
         report = reindex(conn)
         assert report.upgraded is False
+        assert report.indexed == 1
+        assert orphan in _vocab(conn)  # rebuilt from memories
         assert _fts_paths(conn, "orphanword") == ["/raw.md"]
     finally:
         conn.close()

@@ -493,13 +493,15 @@ def _rebuild_index(conn: sqlite3.Connection) -> int:
     """Fill the empty memories_fts index from memories; return rows indexed.
 
     One entry per memory: binary rows (content IS NULL) contribute empty
-    content and are therefore findable by path token only.
+    content and are therefore findable by path token only. The count comes from
+    the INSERT cursor -- COUNT on an external-content table enumerates the
+    content rows instead, so it would report memories, not what was indexed.
     """
-    conn.execute(
+    cur = conn.execute(
         "INSERT INTO memories_fts(rowid, path, content) "
         "SELECT rowid, path, coalesce(content, '') FROM memories"
     )
-    return conn.execute("SELECT count(*) FROM memories").fetchone()[0]
+    return cur.rowcount
 
 
 def _reindex_locked(conn: sqlite3.Connection) -> ReindexReport:
