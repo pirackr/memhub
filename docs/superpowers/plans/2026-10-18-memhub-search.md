@@ -249,7 +249,7 @@ LIMIT ? OFFSET ?
   - `match`/`snippet`: `snip` empty string → `match="path"`, `snippet=None`; else `match="content"` and snippet post-truncated to a hard 200-char cap that preserves the matched term (if `len > 200`, cut around the first case-insensitive occurrence of any query term so the term remains inside the window; else keep first 200).
   - `limit`/`offset` validated here: `limit` int 1..50 else `MemhubError("limit must be between 1 and 50")`; `offset >= 0` else `MemhubError("offset must not be negative")`.
 
-- [ ] **Step 2 already covers**: write failing tests first (Step 1):
+- [ ] **Step 1: Write failing tests** in `tests/test_search.py`:
   - Ranking: doc with "widget" in content vs doc with "widget" in path (`/widget/notes.txt` content "gadget") → path hit scores higher (Review Focus: weights).
   - AND semantics: query "alpha beta" matches only doc containing both.
   - Prefix: `cat*` matches "catalog" content; `cat` does not match "catalog" (exact token default).
@@ -261,6 +261,8 @@ LIMIT ? OFFSET ?
   - v1 store → "run memhub reindex" error.
   - `parse_bound` cases: `"2026-10-18"` since → `"2026-10-18T00:00:00Z"`; until → `"2026-10-19T00:00:00Z"`; `"2026-10-18T10:30:00+02:00"` → `"2026-10-18T08:30:00Z"`; `"2026-10-18T10:30:00"` (no tz) → error; reversed range error.
   - limit 0 / 51 / offset -1 → errors.
+
+- [ ] **Step 2: Run** `uv run pytest tests/test_search.py -v` — expect FAIL (`search` undefined).
 
 - [ ] **Step 3: Implement** as specified. Wrap `sqlite3.OperationalError` from the MATCH execution into `MemhubError("invalid search query")` (belt for Review Focus 1 — parser should prevent it).
 
