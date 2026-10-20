@@ -20,7 +20,33 @@ CREATE TABLE IF NOT EXISTS memories (
 );
 """
 
-_SCHEMA_VERSION = 1
+FTS_DDL = """\
+CREATE VIRTUAL TABLE memories_fts USING fts5(
+  path, content, content='memories', content_rowid='rowid',
+  tokenize='unicode61 remove_diacritics 2'
+);
+CREATE TRIGGER memories_ai AFTER INSERT ON memories BEGIN
+  INSERT INTO memories_fts(rowid, path, content)
+  VALUES (new.rowid, new.path, coalesce(new.content, ''));
+END;
+CREATE TRIGGER memories_ad AFTER DELETE ON memories BEGIN
+  INSERT INTO memories_fts(memories_fts, rowid, path, content)
+  VALUES ('delete', old.rowid, old.path, coalesce(old.content, ''));
+END;
+CREATE TRIGGER memories_au AFTER UPDATE ON memories BEGIN
+  INSERT INTO memories_fts(memories_fts, rowid, path, content)
+  VALUES ('delete', old.rowid, old.path, coalesce(old.content, ''));
+  INSERT INTO memories_fts(rowid, path, content)
+  VALUES (new.rowid, new.path, coalesce(new.content, ''));
+END;
+"""
+
+_SCHEMA_VERSION = 2
+
+
+def schema_version(conn: sqlite3.Connection) -> int:
+    """The store's PRAGMA user_version."""
+    return conn.execute("PRAGMA user_version").fetchone()[0]
 
 
 class MemhubError(Exception):
@@ -377,7 +403,9 @@ def init_store(db_path: Path) -> None:
     This is the only function that creates a store file. PRAGMA user_version
     is stamped only on a fresh store: an existing store's version marker is
     never rewritten or downgraded (layer 2 will depend on it for migrations),
-    and a store from a newer memhub version is rejected.
+    and a store from a newer memhub version is rejected. A fresh store gets
+    the full v2 schema (memories + FTS index + triggers); an existing v1
+    store is left untouched -- no implicit migration here (see reindex).
     """
     conn = sqlite3.connect(db_path)
     try:
@@ -389,6 +417,7 @@ def init_store(db_path: Path) -> None:
         ).fetchone()
         conn.executescript(_SCHEMA)
         if has_memories is None:
+            conn.executescript(FTS_DDL)
             conn.execute(f"PRAGMA user_version = {_SCHEMA_VERSION}")
         conn.commit()
     finally:
@@ -414,6 +443,8 @@ def _open_store(db_path: Path) -> Iterator[sqlite3.Connection]:
     # init_store is the only creator.
     conn = sqlite3.connect(path.resolve().as_uri() + "?mode=rw", uri=True)
     try:
+        if schema_version(conn) > _SCHEMA_VERSION:
+            raise MemhubError("store was created by a newer memhub version")
         conn.execute("PRAGMA journal_mode=WAL")
         yield conn
         conn.commit()
