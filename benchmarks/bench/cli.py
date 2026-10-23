@@ -30,6 +30,12 @@ def _parse_csv_ints(value: str) -> tuple[int, ...]:
 
 
 def _cmd_run(args: argparse.Namespace) -> int:
+    if args.limit is not None and args.limit < 0:
+        raise BenchError(f"--limit must be >= 0, got {args.limit}")
+    if not all(1 <= k <= 50 for k in args.k):
+        raise BenchError(
+            f"--k values must be between 1 and 50 (memhub search ceiling), "
+            f"got {','.join(str(k) for k in args.k)}")
     data_dir = Path(args.data_dir) if args.data_dir else DEFAULT_DATA_DIR
     datasets = args.datasets.split(",")
     methods = args.methods.split(",")

@@ -10,12 +10,20 @@ from __future__ import annotations
 import math
 from typing import Sequence
 
+from bench.core import BenchError
+
+
+def _check_k(k: int) -> None:
+    if k <= 0:
+        raise BenchError(f"k must be >= 1, got {k}")
+
 
 def _empty_truth_value(ranked: Sequence[str]) -> float:
     return 1.0 if not ranked else 0.0
 
 
 def recall_at_k(ranked: Sequence[str], truth: frozenset[str], k: int) -> float:
+    _check_k(k)
     if not truth:
         return _empty_truth_value(ranked)
     hits = len(set(ranked[:k]) & truth)
@@ -23,6 +31,7 @@ def recall_at_k(ranked: Sequence[str], truth: frozenset[str], k: int) -> float:
 
 
 def precision_at_k(ranked: Sequence[str], truth: frozenset[str], k: int) -> float:
+    _check_k(k)
     if not truth:
         return _empty_truth_value(ranked)
     hits = len(set(ranked[:k]) & truth)
@@ -37,6 +46,7 @@ def hit_at_1(ranked: Sequence[str], truth: frozenset[str]) -> float:
 
 def mrr(ranked: Sequence[str], truth: frozenset[str], k: int) -> float:
     """Reciprocal rank of the first relevant doc within ranked[:k]."""
+    _check_k(k)
     if not truth:
         return _empty_truth_value(ranked)
     for i, doc_id in enumerate(ranked[:k]):
@@ -47,6 +57,7 @@ def mrr(ranked: Sequence[str], truth: frozenset[str], k: int) -> float:
 
 def ndcg_at_k(ranked: Sequence[str], truth: frozenset[str], k: int) -> float:
     """nDCG@k, binary relevance; ideal discount over min(k, |truth|)."""
+    _check_k(k)
     if not truth:
         return _empty_truth_value(ranked)
     dcg = 0.0
@@ -60,6 +71,8 @@ def ndcg_at_k(ranked: Sequence[str], truth: frozenset[str], k: int) -> float:
 def score(ranked: Sequence[str], truth: frozenset[str], ks: tuple[int, ...]) -> dict[str, float]:
     """Score one item: recall@k/precision@k for each k, hit@1, mrr and
     ndcg at depth max(ks)."""
+    if not ks:
+        raise BenchError("ks must not be empty")
     depth = max(ks)
     out: dict[str, float] = {}
     for k in ks:

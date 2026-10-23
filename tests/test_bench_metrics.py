@@ -82,3 +82,30 @@ def test_score_empty_truth_convention():
     assert all(v == 1.0 for v in scores.values())
     scores = metrics.score(["a"], frozenset(), (1, 5))
     assert all(v == 0.0 for v in scores.values())
+
+
+# --- k guards ---------------------------------------------------------------
+
+import pytest
+
+from bench.core import BenchError
+
+
+@pytest.mark.parametrize("k", [0, -1])
+def test_k_le_zero_raises_bencherror(k):
+    for fn in (metrics.recall_at_k, metrics.precision_at_k, metrics.mrr,
+               metrics.ndcg_at_k):
+        with pytest.raises(BenchError):
+            fn(RANKED, TRUTH, k)
+
+
+def test_k_guard_applies_to_empty_truth_too():
+    # a bad k is a config error even when the empty-truth convention would
+    # otherwise short-circuit the result
+    with pytest.raises(BenchError):
+        metrics.precision_at_k([], frozenset(), 0)
+
+
+def test_score_empty_ks_raises_bencherror():
+    with pytest.raises(BenchError):
+        metrics.score(RANKED, TRUTH, ())

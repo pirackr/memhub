@@ -154,3 +154,6 @@ is built to expose:
 - **Prefix queries** (e.g. `probe*`): `memhub-and` honors the wildcard
   natively through memhub's parser; `memhub-or` tokenizes it away into a
   plain term. Expect the two to diverge on prefix groups.
+- **Path groups**: path probes are standalone path segments
+  (`/docs/<probe>/N.md`), so exact-token methods can match them — a probe
+  fused to digits would be unmatchable (rationale in `gen_synthetic.py`).

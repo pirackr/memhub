@@ -209,6 +209,34 @@ class TestCli:
         row = data["results"][0]["rows"][-1]
         assert "recall@7" in row and "ndcg@7" in row
 
+    def test_negative_limit_exits_2(self, tmp_path, toy_registry, capsys):
+        code = cli.main(["run", "--datasets", "toy", "--methods", "toy",
+                         "--data-dir", str(tmp_path), "--no-write",
+                         "--limit=-1"])
+        assert code == 2
+        err = capsys.readouterr().err
+        assert "limit" in err
+        assert "Traceback" not in err
+
+    def test_k_below_1_exits_2(self, tmp_path, toy_registry, capsys):
+        code = cli.main(["run", "--datasets", "toy", "--methods", "toy",
+                         "--data-dir", str(tmp_path), "--no-write",
+                         "--k", "0"])
+        assert code == 2
+        err = capsys.readouterr().err
+        assert "k" in err
+        assert "Traceback" not in err
+
+    def test_k_above_50_exits_2(self, tmp_path, toy_registry, capsys):
+        # 50 is memhub's search ceiling; k>50 can never return more.
+        code = cli.main(["run", "--datasets", "toy", "--methods", "toy",
+                         "--data-dir", str(tmp_path), "--no-write",
+                         "--k", "1,51"])
+        assert code == 2
+        err = capsys.readouterr().err
+        assert "k" in err
+        assert "Traceback" not in err
+
     def test_download_unknown_exits_2(self, tmp_path, capsys):
         code = cli.main(["download", "nope", "--data-dir", str(tmp_path)])
         assert code == 2
