@@ -114,7 +114,10 @@ docs follow standard TREC-style conventions (unjudged = irrelevant).
 
 recall@k, precision@k (denominator min(k,|truth|) for recall-normalized
 reporting is NOT used — plain IR definitions, documented), hit@1, MRR
-(over top-k), nDCG@k binary relevance. Defaults k = 1, 5, 10.
+computed over the full returned depth = max(k) (so MRR@10 with default
+k), nDCG@k binary relevance. Defaults k = 1, 5, 10. (The external
+prototype's MRR used top-50 depth; the new system's definition is
+authoritative going forward and stated in every result file.)
 
 ### Methods shipped
 
@@ -129,6 +132,13 @@ non-shared), `store.reindex`, then search. Stopword list moves into
 
 - `lme-oracle`, `lme-s`, `lme-m` — LongMemEval adapter (session-level
   truth), same rendering as the external bench (Date header + turns).
+  **Revision pinned:** `download.py` fetches the ORIGINAL
+  `xiaowu0162/longmemeval` files (the deprecated-but-still-served ones
+  our reference numbers came from), NOT `longmemeval-cleaned` — the
+  cleaned split removes noisy sessions and would silently change every
+  number. URLs carry explicit revisions, and every result file records
+  the SHA256 of each dataset file used, so a swapped revision can never
+  silently alter comparability.
 - `locomo` — turn-evidence → session truth, per-conversation shared
   store, skip empty-truth (adversarial) items, report by category.
 - `custom` — the format below.
@@ -142,7 +152,13 @@ non-shared), `store.reindex`, then search. Stopword list moves into
 That is the whole contract. A generator script for synthetic
 ground-truth corpora (port of `bench_accuracy.py`'s corpus builder)
 ships as `bench/gen_synthetic.py --out data/<name>/` so custom
-benchmarks can be materialized on demand.
+benchmarks can be materialized on demand. All six prototype query
+kinds (word, prefix, phrase, path-only, multi-term, no-match) express
+as truth sets (no-match = empty truth) and the generator emits them
+with `group` set to the kind. Method-specific assertions the prototype
+also made (`match=="path"` classification, snippet contains term) are
+NOT part of the benchmark contract — they stay in memhub's pytest
+suite where they already live.
 
 ### Runner & output
 
@@ -151,7 +167,10 @@ benchmarks can be materialized on demand.
 Prints per-dataset tables grouped by item group (question type), one
 table block per method, plus an ALL row; writes JSON with
 `{meta: {date, memhub_version, k, limit, params}, results: [...]}`.
-`--limit` bounds items (first N, deterministic order). Exit non-zero
+`--limit` bounds items (first N, deterministic order). On shared-store
+datasets (locomo) `--limit` counts QA items, and a shared store is
+ingested lazily on its first item's use, so limiting never ingests a
+store the run doesn't query. Exit non-zero
 on adapter errors; a method erroring on one item records the error and
 continues.
 
