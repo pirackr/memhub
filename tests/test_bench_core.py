@@ -1,6 +1,8 @@
 """Tests for bench.core — types, registries, dispatch."""
 
 import dataclasses
+import sys
+import types
 from pathlib import Path
 
 import pytest
@@ -136,3 +138,70 @@ def test_list_datasets_includes_registry_sorted(clean_registries):
     core.register_dataset("reg-ds")(DummyDataset)
     names = core.list_datasets(Path("/nonexistent-bench-dir"))
     assert names == ["reg-ds"]
+
+
+def test_registry_dataset_constructed_positionally(clean_registries, tmp_path):
+    # Pinned convention: every registered dataset class is constructed as
+    # cls(data_dir, name), both positional (Task 3 derives its split from
+    # the registered name).
+    calls = []
+
+    class PositionalDataset(core.Dataset):
+        name = "pos-ds"
+
+        def __init__(*args, **kwargs):
+            calls.append((args, kwargs))
+
+        def items(self):
+            yield from ()
+
+        def corpus(self, store_key):
+            yield from ()
+
+    core.register_dataset("pos-ds")(PositionalDataset)
+    ds = core.create_dataset("pos-ds", tmp_path)
+    assert isinstance(ds, PositionalDataset)
+    (self_arg, data_dir_arg, name_arg), kwargs = calls[0]
+    assert self_arg is ds
+    assert (data_dir_arg, name_arg) == (tmp_path, "pos-ds")
+    assert kwargs == {}
+
+
+def _stub_bench_custom(monkeypatch):
+    """Install a stub bench.custom module; returns the call log."""
+    calls = []
+
+    class StubCustomDataset:
+        def __init__(*args, **kwargs):
+            calls.append((args, kwargs))
+
+    stub = types.ModuleType("bench.custom")
+    stub.CustomDataset = StubCustomDataset
+    monkeypatch.setitem(sys.modules, "bench.custom", stub)
+    return calls
+
+
+def test_create_dataset_custom_dir_dispatch(clean_registries, tmp_path, monkeypatch):
+    calls = _stub_bench_custom(monkeypatch)
+    (tmp_path / "myds").mkdir()
+    (tmp_path / "myds" / "corpus.jsonl").write_text("")
+
+    ds = core.create_dataset("myds", tmp_path)
+
+    assert isinstance(ds, sys.modules["bench.custom"].CustomDataset)
+    (self_arg, data_dir_arg, name_arg), kwargs = calls[0]
+    assert self_arg is ds
+    assert (data_dir_arg, name_arg) == (tmp_path, "myds")  # positional
+    assert kwargs == {}
+
+
+def test_create_dataset_custom_trigger_requires_corpus_file(
+    clean_registries, tmp_path, monkeypatch
+):
+    calls = _stub_bench_custom(monkeypatch)
+    (tmp_path / "myds").mkdir()  # dir exists but no corpus.jsonl -> registry path
+
+    with pytest.raises(core.BenchError):
+        core.create_dataset("myds", tmp_path)
+
+    assert calls == []
