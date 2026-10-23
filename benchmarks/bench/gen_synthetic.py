@@ -107,13 +107,19 @@ def generate(docs: int, seed: int) -> tuple[list[dict], list[dict]]:
                         "truth": [f"doc{doc_num:04d}"]})
 
     # multi: two probes; truth = docs containing BOTH (AND semantics).
+    # Distractor docs receiving only-a or only-b are drawn disjoint from
+    # the truth set and from each other, so no doc outside truth ever
+    # contains both probes (truth must be exactly the docs containing both).
     for n in range(N_MULTI):
         a, b = probes[pi], probes[pi + 1]; pi += 2
         both = pick(rng.randint(1, 4))
         embed(both, a)
         embed(both, b)
-        embed(pick(3), a)   # distractors: only-a and only-b docs
-        embed(pick(3), b)
+        both_set = set(both)
+        rest = [i for i in range(docs) if i not in both_set]
+        distractors = rng.sample(rest, min(6, len(rest)))
+        embed(distractors[:3], a)
+        embed(distractors[3:], b)
         queries.append({"id": f"multi-{n:02d}", "group": "multi",
                         "query": f"{a} {b}",
                         "truth": [f"doc{i:04d}" for i in both]})

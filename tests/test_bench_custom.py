@@ -101,17 +101,33 @@ def test_generate_path_truth_text_lacks_probe(synthetic):
             assert probe not in by_id[doc_id]["text"].split()
 
 
-def test_generate_multi_truth_contains_both(synthetic):
-    corpus, queries = synthetic
+def _multi_exact_truth(corpus, queries):
     by_id = {row["id"]: row for row in corpus}
     multi = [q for q in queries if q["group"] == "multi"]
     assert multi
     for q in multi:
         terms = q["query"].split()
         assert len(terms) == 2
+        # truth docs contain both terms...
         for doc_id in q["truth"]:
             words = set(by_id[doc_id]["text"].split())
-            assert set(terms) <= words
+            assert set(terms) <= words, q
+        # ...and NO other doc does (truth is complete: a perfect method
+        # returning every doc containing both must match truth exactly).
+        containing = {doc_id for doc_id, row in by_id.items()
+                      if set(terms) <= set(row["text"].split())}
+        assert containing == set(q["truth"]), q
+
+
+def test_generate_multi_truth_contains_both(synthetic):
+    corpus, queries = synthetic
+    _multi_exact_truth(corpus, queries)
+
+
+@pytest.mark.parametrize("docs,seed", [(40, 7), (40, 13), (60, 99), (500, 42)])
+def test_generate_multi_truth_exact_across_seeds(docs, seed):
+    corpus, queries = gen_synthetic.generate(docs=docs, seed=seed)
+    _multi_exact_truth(corpus, queries)
 
 
 def test_generate_nomatch_probe_absent_from_corpus(synthetic):
