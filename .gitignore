@@ -2,3 +2,5 @@
 .envrc 
 .worktrees/
 __pycache__/
+benchmarks/data/
+benchmarks/results/
