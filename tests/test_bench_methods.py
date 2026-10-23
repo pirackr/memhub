@@ -70,6 +70,12 @@ def test_search_depth_validated(make):
         m.search("alpha", 0)
 
 
+def test_ingest_normalizes_paths(make):
+    m = make("memhub-and")
+    m.ingest([core.Doc(id="d9", text="zeta widget", path="docs/xyz.md")])
+    assert m.search("zeta", 10) == ["d9"]
+
+
 def test_close_removes_temp_dir(make):
     m = make("memhub-and")
     tmpdir = m._tmpdir

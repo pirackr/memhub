@@ -48,7 +48,9 @@ class MemhubMethod(Method):
         for doc in docs:
             path = doc.path or f"/docs/{doc.id}"
             store.put(self._conn, path, doc.text.encode(), "text/markdown")
-            self._ids[path] = doc.id
+            # store.put normalizes the path; key the map with the same form
+            # search returns, or hits for non-normalized paths drop silently.
+            self._ids[store.normalize_path(path)] = doc.id
         self._conn.commit()
         store.reindex(self._conn)
 
