@@ -317,10 +317,10 @@ LIMIT ? OFFSET ?
 - Test: none (benchmark script; smoke-run only)
 
 **Interfaces:**
-- Consumes: built CLI (`uv run memhub ...`), same conventions as `benchmarks/bench.py` (`run()` helper style, `--iters`).
+- Consumes: built CLI (`uv run memhub ...`), same conventions as `benchmarks/bench_ops.py` (`run()` helper style, `--iters`).
 - Produces: a script that generates a representative corpus (≥2,000 synthetic text docs, ~500 MB total, plus 50 binary blobs), then measures and prints (stderr + JSON via `--out`): `reindex` build time on the full corpus, per-mutation index cost (put/mv/rm with triggers active), query latency for 20 varied queries (common word, rare word, phrase, prefix, with `--since` filter), and final `memories_fts` index size (`SELECT ... FROM fts5vocab` or `pgsz*pgcount` from `pragma_page_count` delta). No numeric promises — the spec requires the data be recorded, not thresholds.
 
-- [ ] **Step 1: Write** `benchmarks/bench_search.py` per the interface above (reuse `bench.py`'s subprocess/timing helpers by import or small copy).
+- [ ] **Step 1: Write** `benchmarks/bench_search.py` per the interface above (reuse `bench_ops.py`'s subprocess/timing helpers by import or small copy).
 - [ ] **Step 2: Smoke-run** `uv run python benchmarks/bench_search.py --iters 1 --out /tmp/bench_search.json` — completes, JSON written.
 - [ ] **Step 3: Record** the smoke numbers in a short "Benchmark results" section appended to the spec doc, then commit `"bench: search/reindex benchmark harness + first corpus run"`.
 

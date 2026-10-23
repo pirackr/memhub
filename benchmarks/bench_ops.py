@@ -5,7 +5,7 @@ Every measurement is a real subprocess invocation (the honest unit an agent
 pays): memhub CLI vs coreutils doing the same job on a plain directory.
 Both sides run on the same storage medium (same parent temp dir).
 
-Usage: uv run python benchmarks/bench.py [--iters N] [--out results.json]
+Usage: uv run python benchmarks/bench_ops.py [--iters N] [--out results.json]
 """
 
 import argparse
