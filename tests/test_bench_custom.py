@@ -7,6 +7,7 @@ import pytest
 
 from bench import core
 from bench import gen_synthetic
+from bench import metrics
 from bench.custom import CustomDataset
 
 GROUPS = {"word", "prefix", "phrase", "path", "multi", "nomatch"}
@@ -99,6 +100,47 @@ def test_generate_path_truth_text_lacks_probe(synthetic):
         assert probe  # non-empty truth guaranteed by other test
         for doc_id in q["truth"]:
             assert probe not in by_id[doc_id]["text"].split()
+
+
+def test_generate_path_probe_is_standalone_path_segment(synthetic):
+    # The FTS unicode61 tokenizer keeps "qfpaaa12" (probe adjacent to
+    # digits) as ONE token, so a bare-probe query can never match the path
+    # column. The probe must be a standalone path segment.
+    corpus, queries = synthetic
+    by_id = {row["id"]: row for row in corpus}
+    path = [q for q in queries if q["group"] == "path"]
+    assert path
+    for q in path:
+        probe = q["query"]
+        for doc_id in q["truth"]:
+            assert f"/{probe}/" in by_id[doc_id]["path"], q
+
+
+# --- exact-truth contract: an exact-token method must reach the truth ---------
+
+
+@pytest.fixture(scope="module")
+def memhub_and_on_synthetic():
+    from bench import methods
+
+    corpus, queries = gen_synthetic.generate(docs=100, seed=7)
+    m = methods.MemhubAnd()
+    m.ingest([core.Doc(id=r["id"], text=r["text"], path=r["path"])
+              for r in corpus])
+    yield m, corpus, queries
+    m.close()
+
+
+@pytest.mark.parametrize("group", ["word", "phrase", "path"])
+def test_memhub_and_recall_1_on_exact_truth_groups(memhub_and_on_synthetic,
+                                                   group):
+    m, corpus, queries = memhub_and_on_synthetic
+    group_queries = [q for q in queries if q["group"] == group]
+    assert group_queries
+    for q in group_queries:
+        ranked = m.search(q["query"], k=10)
+        rec = metrics.recall_at_k(ranked, frozenset(q["truth"]), k=10)
+        assert rec == 1.0, (q["id"], q["query"], ranked, q["truth"])
 
 
 def _multi_exact_truth(corpus, queries):

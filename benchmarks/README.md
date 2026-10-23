@@ -154,7 +154,3 @@ is built to expose:
 - **Prefix queries** (e.g. `probe*`): `memhub-and` honors the wildcard
   natively through memhub's parser; `memhub-or` tokenizes it away into a
   plain term. Expect the two to diverge on prefix groups.
-- **Path-group probes adjacent to digits** (e.g. `qxyz123.md`): whether a
-  method's matching tokenizes `qxyz123` as containing `qxyz` is
-  method-dependent; path-group scores differ across methods for this
-  reason.

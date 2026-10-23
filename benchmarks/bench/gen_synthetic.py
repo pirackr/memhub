@@ -96,12 +96,15 @@ def generate(docs: int, seed: int) -> tuple[list[dict], list[dict]]:
                         "query": f'"{a} {b}"',
                         "truth": [f"doc{i:04d}" for i in truth_idx]})
 
-    # path: probe ONLY in the doc path, content is filler-only.
+    # path: probe ONLY in the doc path, content is filler-only. The probe
+    # is a standalone path segment: unicode61 tokenizes "probe123" as one
+    # token, so a probe adjacent to digits is unmatchable by a bare-probe
+    # query and would make the truth unreachable for exact-token methods.
     path_docs: list[tuple[str, str]] = []
     for n in range(N_PATH):
         term = probes[pi]; pi += 1
         doc_num = docs + n
-        path_docs.append((f"doc{doc_num:04d}", f"/docs/{term}{doc_num}.md",
+        path_docs.append((f"doc{doc_num:04d}", f"/docs/{term}/{doc_num}.md",
                           filler_text(FILLER_PER_DOC)))
         queries.append({"id": f"path-{n:02d}", "group": "path", "query": term,
                         "truth": [f"doc{doc_num:04d}"]})
