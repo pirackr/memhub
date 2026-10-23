@@ -178,6 +178,11 @@ def _stub_bench_custom(monkeypatch):
     stub = types.ModuleType("bench.custom")
     stub.CustomDataset = StubCustomDataset
     monkeypatch.setitem(sys.modules, "bench.custom", stub)
+    # Also shadow the package attribute: once bench.custom has been imported
+    # by any other test module, `from bench import custom` resolves via the
+    # attribute, not sys.modules.
+    import bench
+    monkeypatch.setattr(bench, "custom", stub, raising=False)
     return calls
 
 
