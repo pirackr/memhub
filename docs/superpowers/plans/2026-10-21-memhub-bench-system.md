@@ -84,8 +84,8 @@
 - Test: `tests/test_bench_datasets.py`
 
 **Interfaces:**
-- Consumes: `core.Dataset/Item/Doc/register_dataset`.
-- Produces: `datasets.LmeDataset(data_dir: Path, split: str)` registered as `lme-oracle` / `lme-s` / `lme-m` (split from name suffix); file `data_dir / f"longmemeval_{split}.json"`. `datasets.LocomoDataset(data_dir)` registered `locomo`; file `data_dir / "locomo10.json"`.
+- Consumes: `core.Dataset/Item/Doc/register_dataset`. Constructor convention (controller ruling): every registered dataset class is constructed as `cls(data_dir, name)`.
+- Produces: `datasets.LmeDataset(data_dir: Path, name: str)` registered as `lme-oracle` / `lme-s` / `lme-m` (split derived from name suffix after `lme-`); file `data_dir / f"longmemeval_{split}.json"`. `datasets.LocomoDataset(data_dir, name)` registered `locomo`; file `data_dir / "locomo10.json"`.
 - LME mapping (port prototype `lme_sessions`/`iter_longmemeval`): `Item(id=question_id, group=question_type, query=question, truth=frozenset(answer_session_ids), store=question_id)`; `corpus(store)` yields `Doc(id=sid, path=f"/sessions/{sid}.md", text=f"Date: {date}\n" + "\n".join(f"{t['role']}: {t['content']}" for t in turns))` zipping `haystack_session_ids`/`haystack_dates`/`haystack_sessions`; `source_files()` → `[file]`; missing file → `BenchError` naming the path and `bench download`.
 - LoCoMo mapping (port `iter_locomo`): per conversation `conv["conversation"]`, session count = max `n` over `session_\d+` keys; session doc `id=f"{sample_id}/session{i}"`, `path=f"/conv/{sample_id}/session{i}.md"`, text `Date: {session_{i}_date_time}\n` + `"\n".join(f"{t['speaker']}: {t['text']}")`; QA items: evidence may be a `repr` string → `ast.literal_eval` guarded; truth = session doc ids from `D(\d+):` evidence prefixes; empty truth → skip item; `Item(id=f"{sample_id}:{qa_index}", group=f"cat{category}", query=question, store=sample_id)`; `corpus(store)` returns that conversation's session docs; `source_files()` → `[locomo file]`.
 
